@@ -180,28 +180,19 @@ Best-of-5, this machine, against the LuaJIT 2.1 built in `../src`:
 
 | bench | LJX | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
 |-------|----:|---------------:|-----------:|-------------:|-----------:|
-| fib   | **0.063s** | 0.346s | **5.52× faster** | 0.066s | **0.95× — faster** |
-| loop  | **0.076s** | 0.353s | **4.64× faster** | 0.062s | 1.22× |
-| array | **0.0099s** | 0.041s | **4.16× faster** | 0.0078s | 1.28× |
-| tab   | **0.027s** | 0.067s | **2.50× faster** | 0.033s | **0.83× — faster** |
-| str   | **0.133s** | 0.147s | **1.10× faster** | 0.068s | 1.97× |
-| real  | **0.0068s** | 0.048s | **7.07× faster** | 0.0028s | 2.42× |
+| fib    | **0.055s** | 0.346s | **6.3× faster** | 0.042s | 1.31× |
+| loop   | **0.077s** | 0.353s | **4.6× faster** | 0.061s | 1.26× |
+| array  | **0.0092s** | 0.041s | **4.5× faster** | 0.0076s | 1.21× |
+| tab    | **0.020s** | 0.053s | **2.6× faster** | 0.025s | **0.83× — faster** |
+| str    | **0.095s** | 0.113s | **1.19× faster** | 0.055s | 1.72× |
+| real   | **0.0050s** | 0.041s | **8.3× faster** | 0.0020s | 2.4× |
+| branch | **0.042s** | 0.066s | **1.57× faster** | 0.026s | 1.67× |
 
-Reading this honestly:
-
-- **`tab`** (fill a table, then sum it) is the one benchmark where LJX beats
-  LuaJIT's full trace compiler, and the reason is a strategy difference, not
-  raw codegen: pre-growing the array once at loop entry avoids the incremental
-  reallocation LuaJIT does as the table grows.
-- **`array`** and **`loop`** are 4.2× faster than LuaJIT's hand-written
-  assembly interpreter and land within **1.22–1.28×** of its trace compiler.
-- **`fib`** is level with LuaJIT's trace compiler. Recursion is real machine
-  recursion.
-- **`real`** — objects with methods, `__index` dispatch, string-keyed
-  dictionaries — was **17.7× behind** LuaJIT's trace compiler before the trace
-  tier existed and is **2.4×** behind now. See below.
-- **`str`** is the remaining soft spot: string building still allocates and
-  interns per operation, and no tier touches it.
+`real` is objects, `__index` method dispatch and string-keyed dictionaries;
+`branch` is a branch-heavy loop plus nested loops. Before the trace tier
+existed, `real` was **17.7× behind** LuaJIT's trace compiler and `branch`-like
+shapes ran in the interpreter. Every benchmark's output is checked against the
+interpreter (`LJX_NOJIT=1`) and against LuaJIT itself.
 
 ### The three tiers, measured separately
 

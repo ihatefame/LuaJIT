@@ -123,9 +123,10 @@ public:
     std::uint32_t m_uArraySize = 0;  // exclusive bound, 0-based
     std::uint32_t m_uHashMask = 0;   // size-1; 0 = shared nil-node
     core::MRef_t m_rFreeTop;
-    // Bumped by every binding change. Inline caches record the version they
-    // were filled at, so a single compare invalidates them precisely — no
-    // global flush, no shape objects.
+    // Bumped by every STRUCTURAL change — key creation, Brent eviction,
+    // resize — i.e. whenever a node's address stops meaning what it meant.
+    // Inline caches and traces hold slot addresses guarded by this counter;
+    // plain value stores are invisible to it and need no invalidation.
     std::uint32_t m_uVersion = 0;
 
     // Creation: uArraySizeHint slots in the array part (0-based exclusive),
@@ -321,12 +322,20 @@ static_assert(core::IsFrozenLayout<C_GcProto> && sizeof(C_GcProto) == 72);
 // receiver and resolves through its metatable's __index — the shape of every
 // method call. A hit costs two identity compares and two version compares,
 // replacing a metamethod lookup plus a second table search.
+// The cache stores SLOT ADDRESSES, not values, and the version counters bump
+// only on STRUCTURAL changes (key creation, Brent moves, resize) — never on a
+// plain value store. A store to an existing key therefore flows through the
+// cached slot with no invalidation at all; what the versions protect is the
+// stability of the two slot addresses. The __index binding itself is
+// re-checked by value on every probe, since a store to mt.__index is exactly
+// the kind of write the structural version no longer sees.
 struct InlineCache_t {
     core::GcRef_t rMeta;          // receiver's metatable when filled
     std::uint32_t uMetaVersion;
     core::GcRef_t rIndexTable;    // the table __index resolved to
     std::uint32_t uIndexVersion;
-    TValue_t tvValue;             // what the lookup produced
+    core::MRef_t rIndexSlot;      // &mt.__index's value word
+    core::MRef_t rSlot;           // &indexTable[key]'s value word; null = nil
 };
 static_assert(core::IsFrozenLayout<InlineCache_t> && sizeof(InlineCache_t) == 24);
 static_assert(core::IsFrozenLayout<C_GcFunction> && sizeof(C_GcFunction) == 24);

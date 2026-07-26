@@ -44,6 +44,10 @@ check trace_narrow "$(printf '0\n199\n45450\t11\n297000\n80199\n41')"
 # Side traces: hot exits grow chained traces (branchy loops, nested loops,
 # while-in-while, break out of an inner loop, -0.0 equality).
 check trace_side "$(printf '2667333\t2667\n2000\n184650\n106\t106\n20100\t8000\n2100\t0\n9300')"
+# Structural versions: value stores bump nothing; reassigned methods, swapped
+# __index/metatables, shadowing keys and dictionary stores must all be seen
+# through slot addresses.
+check trace_invalidate "$(printf '202099\n36004\n28004\n6001\n12000\n102049\n4000\t8000')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
 # script in tests/lua is run both ways and the outputs compared.

@@ -190,7 +190,6 @@ void C_GcTable::Resize(C_Universe& uni, std::uint32_t uNewArraySize, std::uint32
 
 TValue_t* C_GcTable::Set(C_Universe& uni, const TValue_t& tvRawKey) {
     m_Header.uExtra1 = 0;  // any store invalidates the negative metamethod cache
-    BumpVersion();         // …and any inline cache that resolved through us
 
     const std::uint32_t uIndex = ArrayIndex(tvRawKey);
     if (uIndex < m_uArraySize) return &ArrayPart(uni, this)[uIndex];
@@ -237,6 +236,7 @@ TValue_t* C_GcTable::Set(C_Universe& uni, const TValue_t& tvRawKey) {
         m_rFreeTop = core::PtrToRef(uni.ArenaBase(), pFree);
         TableNode_t* pCollider = pMain;
         TableNode_t* pColliderMain = MainPosition(uni, this, pCollider->tvKey);
+        BumpVersion();   // key creation: node addresses change meaning
         if (pColliderMain != pMain) {
             // Brent's eviction: the resident node doesn't belong here — move
             // it to the free node so the main position owns our key.
@@ -258,6 +258,7 @@ TValue_t* C_GcTable::Set(C_Universe& uni, const TValue_t& tvRawKey) {
         pMain->rNext = core::PtrToRef(uni.ArenaBase(), pFree);
         return &pFree->tvValue;
     }
+    BumpVersion();   // key creation
     pMain->tvKey = tvKey;
     pMain->tvValue = TValue_t::Nil();
     pMain->rNext = core::MRef_t{};

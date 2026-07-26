@@ -212,7 +212,6 @@ bool C_TraceJit::GuardEntryInt32(IrRef rRef, const BcIns_t* pResumePc) {
 void C_TraceJit::PinValue(const TValue_t& tvValue) {
     if (!tvValue.IsGcObject()) return;
     *m_pUniverse->Registry()->Set(*m_pUniverse, tvValue) = TValue_t::Boolean(true);
-    m_pUniverse->Registry()->BumpVersion();
 }
 
 IrRef C_TraceJit::Constant(const TValue_t& tvValue) {
@@ -1147,9 +1146,12 @@ bool C_TraceJit::RecordTableGet(const BcIns_t& ins, const BcIns_t* pNext, TValue
     }
 
     // This is the method-lookup shape. Guard the metatable's identity and the
-    // versions of the two tables the chain went through; under those guards
-    // the resolved value is a compile-time CONSTANT, which is what makes the
-    // following call site monomorphic and inlinable.
+    // STRUCTURAL versions of the two tables the chain went through: those pin
+    // the two slot addresses involved, which fold to constants. The values in
+    // them are then re-checked/loaded — a plain store bumps nothing, and this
+    // is exactly what makes that correct: the new value flows out of the same
+    // slot. A call site stays monomorphic through RecordCall's identity guard
+    // on the loaded function.
     (void)EmitGuard(EIrOp::GuardEqI,
                     Emit(EIrOp::LoadU32, EIrType::Int,
                          Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr, ConstantInt(kOfsTabMeta)),
@@ -1171,8 +1173,17 @@ bool C_TraceJit::RecordTableGet(const BcIns_t& ins, const BcIns_t* pNext, TValue
                     Emit(EIrOp::LoadU32, EIrType::Int, ConstantPtr(&pIndexTab->m_uVersion),
                          kIrNone),
                     ConstantInt(pIndexTab->m_uVersion), pResumePc);
+    // The __index binding itself is a VALUE at a (now pinned) slot address:
+    // `mt.__index = other` is a plain store the structural version cannot see.
+    (void)EmitGuard(EIrOp::GuardEq,
+                    Emit(EIrOp::LoadTV, EIrType::Int, Materialize(ConstantPtr(pIndex)),
+                         kIrNone),
+                    Materialize(Constant(*pIndex)), pResumePc);
     if (m_eState != ETraceState::Recording) return false;
-    SetSlot(nB + ins.A(), Constant(*pSlot));
+    const IrRef rVal = EmitSnapped(EIrOp::LoadTV, ObservedType(*pSlot),
+                                   Materialize(ConstantPtr(pSlot)), kIrNone, pResumePc);
+    if (rVal == kIrNone) return false;
+    SetSlot(nB + ins.A(), rVal);
     return true;
 }
 
@@ -1233,11 +1244,10 @@ bool C_TraceJit::RecordTableSet(const BcIns_t& ins, const BcIns_t* pNext, TValue
     if (bAbsent || rNode == kIrNone) return false;
     const TValue_t* pSlot = pTab->Get(*m_pUniverse, tvKey);
     if (!pSlot || pSlot->IsNil()) return false;
+    // No version bump: the structural version does not see value stores, and
+    // both the interpreter's caches and other traces re-read values through
+    // slot addresses, so the store is visible to them by construction.
     (void)Emit(EIrOp::StoreTV, TypeOf(rValue), rNode, rValue);
-    // An interpreter inline cache may have resolved through this table, so the
-    // store must invalidate it exactly as C_GcTable::BumpVersion would.
-    (void)Emit(EIrOp::IncU32, EIrType::Nothing,
-               Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr, ConstantInt(kOfsTabVersion)), kIrNone);
     return m_eState == ETraceState::Recording;
 }
 

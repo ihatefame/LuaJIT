@@ -174,7 +174,6 @@ LJX_NOINLINE void NewIndexSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_t*
             const TValue_t* pSlot = pTab->Get(*pUni, tvKey);
             if (pSlot && !pSlot->IsNil()) {  // existing key: raw store
                 *const_cast<TValue_t*>(pSlot) = tvValue;
-                pTab->BumpVersion();   // an inline cache may have resolved here
                 return;
             }
             auto* pMt = pUni->Deref<C_GcTable>(pTab->m_rMetatable);
@@ -222,6 +221,8 @@ LJX_FORCEINLINE InlineCache_t* CacheLine(C_Universe* pUni, TValue_t* pBase,
 }
 
 // Returns true and fills tvOut when the cache is valid for this receiver.
+// The versions are STRUCTURAL: they pin the two slot addresses, and the
+// values are re-read through them, so a plain store needs no invalidation.
 LJX_FORCEINLINE bool CacheProbe(C_Universe* pUni, const InlineCache_t* pCache,
                                 const C_GcTable* pTab, TValue_t& tvOut) noexcept {
     if (!pCache || pCache->rMeta.IsNull() || pTab->m_rMetatable != pCache->rMeta)
@@ -230,7 +231,20 @@ LJX_FORCEINLINE bool CacheProbe(C_Universe* pUni, const InlineCache_t* pCache,
     if (pMeta->m_uVersion != pCache->uMetaVersion) return false;
     const auto* pIndexTab = pUni->Deref<C_GcTable>(pCache->rIndexTable);
     if (!pIndexTab || pIndexTab->m_uVersion != pCache->uIndexVersion) return false;
-    tvOut = pCache->tvValue;
+    // The __index binding is checked by VALUE: swapping mt.__index is a plain
+    // store the structural version does not see.
+    const auto* pIndexSlot = static_cast<const TValue_t*>(
+        core::RefToPtr(pUni->ArenaBase(), pCache->rIndexSlot));
+    if (pIndexSlot->uRaw != TValue_t::GcObject(EValueTag::Table, pIndexTab).uRaw)
+        return false;
+    if (pCache->rSlot.IsNull()) {   // proved absent when filled; key creation bumps
+        tvOut = TValue_t::Nil();
+        return true;
+    }
+    const TValue_t tvSlot =
+        *static_cast<const TValue_t*>(core::RefToPtr(pUni->ArenaBase(), pCache->rSlot));
+    if (tvSlot.IsNil()) return false;   // died underneath: re-resolve the chain
+    tvOut = tvSlot;
     return true;
 }
 
@@ -257,7 +271,9 @@ LJX_NOINLINE TValue_t IndexMissCached(C_Universe* pUni, TValue_t* pBase, const B
             pCache->uMetaVersion = pMeta->m_uVersion;
             pCache->rIndexTable = pUni->MakeRef(pIndexTab);
             pCache->uIndexVersion = pIndexTab->m_uVersion;
-            pCache->tvValue = tvResult;
+            pCache->rIndexSlot = core::PtrToRef(pUni->ArenaBase(), pIndex);
+            pCache->rSlot = pSlot ? core::PtrToRef(pUni->ArenaBase(), pSlot)
+                                  : core::MRef_t{};
         }
         if (pSlot && !pSlot->IsNil()) return tvResult;
         if (pIndexTab->m_rMetatable.IsNull()) return TValue_t::Nil();
@@ -933,7 +949,6 @@ LJX_H(TSetV) {
         const TValue_t* pSlot = pTab->Get(*pUni, tvKey);
         if (pSlot && !pSlot->IsNil()) {          // existing key: raw store
             *const_cast<TValue_t*>(pSlot) = pBase[uRa];
-            pTab->BumpVersion();
             pUni->Gc().BarrierBackTable(pTab);
             LJX_NEXT();
         }
@@ -950,7 +965,6 @@ LJX_H(TSetS) {
         const TValue_t* pSlot = pTab->GetStr(*pUni, pKey);
         if (pSlot && !pSlot->IsNil()) [[likely]] {
             *const_cast<TValue_t*>(pSlot) = pBase[uRa];
-            pTab->BumpVersion();   // a cache may have resolved through this table
             pUni->Gc().BarrierBackTable(pTab);
             LJX_NEXT();
         }

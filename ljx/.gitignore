@@ -1,4 +1,5 @@
+/ljx
+/ljx_test
 build/
-ljx
-ljx_test
 *.o
+*.d

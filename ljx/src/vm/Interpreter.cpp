@@ -1101,6 +1101,10 @@ LJX_NOINLINE TraceResume_t RunTrace(jit::Trace_t* pTrace, TValue_t* pBase,
                          exit.pChild ? " -> child" : "");
         pBase += exit.nBaseOffset;
         if (exit.pChild) {
+            if (jit::TraceDebug())
+                std::fprintf(stderr, "[chain] #%u exit %u -> #%u (base%+d)\n",
+                             pTrace->uNumber, uExit, exit.pChild->uNumber,
+                             exit.nBaseOffset);
             pTrace = exit.pChild;
             continue;
         }
@@ -1343,6 +1347,24 @@ std::uint64_t TraceHelpNewFunc(vm::C_Universe* pUni, TValue_t* pBase, std::uint3
         }
     }
     return TValue_t::GcObject(EValueTag::Function, pFn).uRaw;
+}
+
+// A LEAF C builtin: no callback into Lua, at most one result, fixed result
+// type (the recorder's whitelist enforces all three). The call frame is the
+// written-back Lua stack itself; results follow the C-function protocol.
+std::uint64_t TraceHelpCallC(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
+                             std::uint32_t uTop) {
+    vm::TraceGcPoint(pUni, pBase, uTop);
+    const std::uint32_t uFunc = uDesc & 0xff;
+    const std::uint32_t uArgs = (uDesc >> 8) & 0xff;
+    TValue_t* pNewBase = pBase + uFunc + 2;
+    auto* pFn = static_cast<vm::C_GcFunction*>(pBase[uFunc].AsGcPointer());
+    vm::C_LuaThread* pThread = pUni->MainThread();
+    pThread->m_pBase = pNewBase;
+    pThread->m_pTop = pNewBase + uArgs;
+    if (pNewBase + uArgs > pThread->m_pHighWater) pThread->m_pHighWater = pNewBase + uArgs;
+    const std::int32_t nResults = pFn->CFunc()(reinterpret_cast<lua_State*>(pThread));
+    return nResults > 0 ? pNewBase[0].uRaw : TValue_t::Nil().uRaw;
 }
 
 std::uint64_t TraceHelpNewTab(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,

@@ -54,18 +54,26 @@ check trace_alloc "$(printf '3000\t2\t6000\n1\t4000\t400\n17700\n98775\n1\t500\n
 # Closures and calls: fresh closures per iteration (PC-guarded calls), two
 # protos through one call site, upvalue closures, memoization tables with
 # number keys in the hash part.
-check trace_func "$(printf '1300000\n1000\t1000\n45150\n144000\n336000')"
+check trace_func "$(printf '1300000\n1000\t1000\n45150\n144000\n336000\n1080\n7713\t4287\n6000\n1000\t3000\ta-b-c')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
-# script in tests/lua is run both ways and the outputs compared.
+# script in tests/lua is run both ways and the outputs compared. The poisoned
+# pass additionally memsets every freed allocator block, turning any
+# use-after-free from a layout-dependent heisenbug into a deterministic
+# divergence.
 for f in "$DIR"/*.lua; do
   name="$(basename "$f" .lua)"
   case "$name" in bench_*) continue;; esac
   jit_out="$("$LJX" "$f" 2>&1)"
   int_out="$(LJX_NOJIT=1 "$LJX" "$f" 2>&1)"
+  poison_out="$(LJX_POISON=1 "$LJX" "$f" 2>&1)"
   if [ "$jit_out" != "$int_out" ]; then
     echo "FAIL differential:$name (JIT output differs from interpreter)"
     diff <(echo "$int_out") <(echo "$jit_out") | head -6
+    fail=1
+  elif [ "$poison_out" != "$jit_out" ]; then
+    echo "FAIL differential:$name (poisoned run differs: use-after-free)"
+    diff <(echo "$jit_out") <(echo "$poison_out") | head -6
     fail=1
   else
     echo "ok   differential:$name"

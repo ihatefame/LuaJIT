@@ -59,3 +59,29 @@ mix[2.5] = 88
 local s5 = 0
 for i = 1, 2000 do s5 = s5 + mix[3] + mix[1000000] + mix[2.5] end
 print(s5)
+
+-- 6. leaf C builtins called from compiled loops through the generic helper
+local parts = {}
+for i = 1, 600 do parts[i] = tostring(i % 50) end
+local ln = 0
+for i = 1, 600 do ln = ln + #parts[i] end
+print(ln)
+
+local mx, mn = 0, 0
+for i = 1, 2000 do
+  mx = mx + math.max(i % 7, 3)
+  mn = mn + math.min(i % 7, 3)
+end
+print(mx, mn)
+
+local subs = 0
+local base = "abcdefghij"
+for i = 1, 2000 do
+  local piece = string.sub(base, (i % 5) + 1, (i % 5) + 3)
+  subs = subs + #piece
+end
+print(subs)
+
+local built = {}
+for i = 1, 1000 do table.insert(built, i * 3) end
+print(#built, built[1000], table.concat({"a", "b", "c"}, "-"))

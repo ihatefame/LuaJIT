@@ -1,4 +1,5 @@
 // LJX — core implementations: virtual arena, allocator, PRNG, FP→int kernels.
+#include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
 #include <sys/random.h>
@@ -195,6 +196,11 @@ void C_SegregatedAllocator::Free(void* pBlock, std::size_t uBytes) noexcept {
     if (!pBlock) return;
     uBytes = (uBytes + 15) & ~std::size_t{15};
     m_uTotal -= uBytes;
+    // LJX_POISON=1: make any use-after-free deterministic instead of
+    // layout-dependent. 0xDB bytes form a value with an out-of-range tag, so
+    // a stale TValue read trips a type guard or an assert immediately.
+    static const bool bPoison = std::getenv("LJX_POISON") != nullptr;
+    if (bPoison) std::memset(pBlock, 0xDB, uBytes);
     if (uBytes <= kMaxSmallClass) {
         void** ppHead = &m_vFreeLists[uBytes >> 4];
         *static_cast<void**>(pBlock) = *ppHead;

@@ -77,6 +77,7 @@ enum class EIrType : std::uint8_t {
     X(CallCat)        /* rOp1 = desc first|count<<8; -> tagged string        */ \
     X(CallLen)        /* rOp1 = desc table slot; -> length as Int            */ \
     X(CallNewFunc)    /* rOp1 = desc protoIdx|frameBase<<16; -> tagged func */ \
+    X(CallC)          /* rOp1 = desc func|args<<8; leaf C builtin call      */ \
     /* control */                                                              \
     X(Loop)           /* the back edge                                      */ \
     X(End)            /* terminal: write everything back, leave the trace   */
@@ -105,6 +106,7 @@ enum class EIrOp : std::uint8_t {
         case EIrOp::CallCat:
         case EIrOp::CallLen:
         case EIrOp::CallNewFunc:
+        case EIrOp::CallC:
         case EIrOp::Loop:
         case EIrOp::End:
             return false;

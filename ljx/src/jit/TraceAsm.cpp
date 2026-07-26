@@ -190,10 +190,14 @@ void C_TraceAsm::ComputeInvariance() {
     m_bHasCalls = false;
     for (const IrIns_t& insScan : m_vIns) {
         switch (insScan.eOp) {
-            case EIrOp::CallSetNew: case EIrOp::CallSetNewK:
+            // CallC conservatively counts as resizing: table.insert creates
+            // keys. The pure leaves (tostring, math.max) lose field hoisting
+            // they would not need, which is the safe direction.
+            case EIrOp::CallSetNew: case EIrOp::CallSetNewK: case EIrOp::CallC:
                 bResizes = true;
                 [[fallthrough]];
             case EIrOp::CallNewTab: case EIrOp::CallCat: case EIrOp::CallLen:
+            case EIrOp::CallNewFunc:
                 m_bHasCalls = true;
                 break;
             default: break;
@@ -241,6 +245,7 @@ void C_TraceAsm::ComputeInvariance() {
             // constant operands would otherwise satisfy the default rule.
             case EIrOp::CallNewTab: case EIrOp::CallSetNew: case EIrOp::CallSetNewK:
             case EIrOp::CallCat: case EIrOp::CallLen: case EIrOp::CallNewFunc:
+            case EIrOp::CallC:
                 break;
             case EIrOp::LoadU32:
                 bInv = !bResizes && IsStableField(ins.rOp1) && Inv(ins.rOp1);
@@ -564,11 +569,16 @@ bool C_TraceAsm::EmitHelperCall(std::size_t uIdx, const void* pFn, bool bHasResu
     m_Emit.MovR64Imm64(0 /*rax*/, reinterpret_cast<std::uint64_t>(pFn));
     m_Emit.CallRax();
     // 4. capture the result FIRST — an entry SLoad may own rax, and its
-    // reload below would overwrite the return value.
+    // reload below would overwrite the return value. The register FILE must
+    // match the result type: a Num lives in xmm, everything else in a GPR.
     if (bHasResult) {
         std::uint8_t uDst = kNoReg;
-        if (!Allocate(uIdx, false, uDst)) return false;
-        m_Emit.MovR64R64(uDst, 0 /*rax*/);
+        const bool bFloatRes = IsFloatType(ins.eType);
+        if (!Allocate(uIdx, bFloatRes, uDst)) return false;
+        if (bFloatRes)
+            m_Emit.MovqXmmR64(uDst, 0 /*rax*/);
+        else
+            m_Emit.MovR64R64(uDst, 0 /*rax*/);
     }
     // 5. the back-edge-mutable registers come back from their spill slots.
     for (std::uint32_t uR = 0; uR < 16; ++uR) {
@@ -923,6 +933,8 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpLen), true);
         case EIrOp::CallNewFunc:
             return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpNewFunc), true);
+        case EIrOp::CallC:
+            return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpCallC), true);
 
         case EIrOp::Loop:
             EmitBackEdge();

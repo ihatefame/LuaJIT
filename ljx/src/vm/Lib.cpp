@@ -375,6 +375,40 @@ std::int32_t LibStringChar(lua_State* pState) {
 
 // --- table ------------------------------------------------------------------
 
+std::int32_t LibTableConcat(lua_State* pState) {
+    C_GcTable* pTab = TabArg(pState, 0, "concat");
+    C_Universe& uni = *Uni(pState);
+    const char* sSep = "";
+    std::uint32_t uSepLen = 0;
+    if (ArgCount(pState) >= 2) {
+        const TValue_t tvSep = Args(pState)[1];
+        if (!tvSep.Is(EValueTag::String))
+            RaiseError(uni, "bad argument #2 to 'concat' (string expected)");
+        auto* pSep = static_cast<C_GcString*>(tvSep.AsGcPointer());
+        sSep = pSep->Data();
+        uSepLen = pSep->Length();
+    }
+    const auto uFirst = ArgCount(pState) >= 3
+                            ? static_cast<std::uint32_t>(NumArg(pState, 2, "concat"))
+                            : 1u;
+    const auto uLast = ArgCount(pState) >= 4
+                           ? static_cast<std::uint32_t>(NumArg(pState, 3, "concat"))
+                           : pTab->Length(uni);
+    std::string sOut;
+    for (std::uint32_t uI = uFirst; uI <= uLast; ++uI) {
+        const TValue_t* pSlot = pTab->Get(uni, TValue_t::Number(uI));
+        if (!pSlot || pSlot->IsNil() ||
+            (!pSlot->Is(EValueTag::String) && !pSlot->IsNumber()))
+            RaiseError(uni, "invalid value (at index %d) in table for 'concat'", uI);
+        std::string sPiece;
+        ToStringBuf(uni, *pSlot, sPiece);
+        sOut += sPiece;
+        if (uI != uLast) sOut.append(sSep, uSepLen);
+    }
+    Args(pState)[0] = TValue_t::GcObject(EValueTag::String, uni.Interner().Intern(sOut));
+    return 1;
+}
+
 std::int32_t LibTableInsert(lua_State* pState) {
     C_GcTable* pTab = TabArg(pState, 0, "insert");
     const std::uint32_t uLen = pTab->Length(*Uni(pState));
@@ -466,7 +500,7 @@ void OpenStdLib(C_Universe& uni) {
     C_GcTable* pGlobals = uni.Globals();
     RegisterFn(uni, pGlobals, "print", &LibPrint);
     RegisterFn(uni, pGlobals, "type", &LibType);
-    RegisterFn(uni, pGlobals, "tostring", &LibToString);
+    RegisterFn(uni, pGlobals, "tostring", &LibToString, EFastFunc::ToString);
     RegisterFn(uni, pGlobals, "tonumber", &LibToNumber);
     RegisterFn(uni, pGlobals, "next", &LibNext);
     RegisterFn(uni, pGlobals, "pairs", &LibPairs);
@@ -499,19 +533,19 @@ void OpenStdLib(C_Universe& uni) {
     RegisterFn(uni, pMath, "cos", &LibMathCos);
     RegisterFn(uni, pMath, "exp", &LibMathExp);
     RegisterFn(uni, pMath, "log", &LibMathLog);
-    RegisterFn(uni, pMath, "max", &LibMathMax);
-    RegisterFn(uni, pMath, "min", &LibMathMin);
+    RegisterFn(uni, pMath, "max", &LibMathMax, EFastFunc::MathMax);
+    RegisterFn(uni, pMath, "min", &LibMathMin, EFastFunc::MathMin);
     RegisterFn(uni, pMath, "random", &LibMathRandom);
     SetField(uni, pMath, "huge", TValue_t::Number(HUGE_VAL));
     SetField(uni, pMath, "pi", TValue_t::Number(3.14159265358979323846));
 
     C_GcTable* pString = C_GcTable::New(uni, 0, 4);
     SetField(uni, pGlobals, "string", TValue_t::GcObject(EValueTag::Table, pString));
-    RegisterFn(uni, pString, "len", &LibStringLen);
-    RegisterFn(uni, pString, "sub", &LibStringSub);
+    RegisterFn(uni, pString, "len", &LibStringLen, EFastFunc::StringLen);
+    RegisterFn(uni, pString, "sub", &LibStringSub, EFastFunc::StringSub);
     RegisterFn(uni, pString, "rep", &LibStringRep);
     RegisterFn(uni, pString, "byte", &LibStringByte);
-    RegisterFn(uni, pString, "char", &LibStringChar);
+    RegisterFn(uni, pString, "char", &LibStringChar, EFastFunc::StringChar);
 
     // String methods via the base-type metatable (s:len() etc.).
     C_GcTable* pStringMeta = C_GcTable::New(uni, 0, 1);
@@ -520,8 +554,9 @@ void OpenStdLib(C_Universe& uni) {
 
     C_GcTable* pTable = C_GcTable::New(uni, 0, 2);
     SetField(uni, pGlobals, "table", TValue_t::GcObject(EValueTag::Table, pTable));
-    RegisterFn(uni, pTable, "insert", &LibTableInsert);
+    RegisterFn(uni, pTable, "insert", &LibTableInsert, EFastFunc::TableInsert);
     RegisterFn(uni, pTable, "remove", &LibTableRemove);
+    RegisterFn(uni, pTable, "concat", &LibTableConcat, EFastFunc::TableConcat);
 
     C_GcTable* pOs = C_GcTable::New(uni, 0, 1);
     SetField(uni, pGlobals, "os", TValue_t::GcObject(EValueTag::Table, pOs));

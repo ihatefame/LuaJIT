@@ -478,6 +478,17 @@ void C_TraceJit::DumpIr() const {
                          static_cast<int>(uS) - kSlotBias,
                          m_vSlotEntry[uS] ? m_vSlotEntry[uS] - kIrBias : -1,
                          m_vSlotValue[uS] ? m_vSlotValue[uS] - kIrBias : -1);
+    for (std::size_t uSn = 0; uSn < m_vSnapshots.size(); ++uSn) {
+        const Snapshot_t& snap = m_vSnapshots[uSn];
+        std::fprintf(stderr, "  snap%-3zu @%p:", uSn, snap.pResumePc);
+        for (std::uint32_t uI = 0; uI < snap.uSlotCount; ++uI) {
+            const SnapSlot_t& ss = m_vSnapSlots[snap.uFirstSlot + uI];
+            std::fprintf(stderr, " [%d]=%s%d", ss.nSlot, IsConstRef(ss.rValue) ? "K" : "",
+                         IsConstRef(ss.rValue) ? kIrBias - 1 - ss.rValue
+                                               : ss.rValue - kIrBias);
+        }
+        std::fprintf(stderr, "\n");
+    }
 }
 
 void C_TraceJit::CloseLoop() {
@@ -1493,11 +1504,38 @@ bool C_TraceJit::RecordBuiltin(vm::EFastFunc eFfid, const BcIns_t& ins, const Bc
         SetSlot(nB + static_cast<std::int32_t>(ins.A()), rRes);
         return true;
     };
+    // Leaf builtins with a FIXED result type: no callback into Lua, at most
+    // one result. The call goes through the generic C helper; the recorder
+    // knows the result type statically, so no guard is needed on it.
+    auto Leaf = [&](EIrType eResType, std::uint32_t uMinArgs,
+                    std::uint32_t uMaxArgs) -> bool {
+        static const bool bOff = std::getenv("LJX_NOCALLC") != nullptr;
+        if (bOff) return false;
+        if (uArgs < uMinArgs || uArgs > uMaxArgs) return false;
+        const bool bWantsResult = uWant == 2;
+        if (uWant > 2) return false;                    // 0 or 1 results only
+        const std::uint32_t uDesc =
+            static_cast<std::uint32_t>(nB + static_cast<std::int32_t>(ins.A())) |
+            (uArgs << 8);
+        const IrRef rRes =
+            EmitSnapped(EIrOp::CallC, eResType, ConstantInt(uDesc), kIrNone, pNext - 1);
+        if (rRes == kIrNone) return false;
+        if (bWantsResult) SetSlot(nB + static_cast<std::int32_t>(ins.A()), rRes);
+        return true;
+    };
     switch (eFfid) {
         case vm::EFastFunc::MathFloor: return Unary(EIrOp::Round, ConstantInt(0x09));
         case vm::EFastFunc::MathCeil:  return Unary(EIrOp::Round, ConstantInt(0x0a));
         case vm::EFastFunc::MathSqrt:  return Unary(EIrOp::Sqrt, kIrNone);
         case vm::EFastFunc::MathAbs:   return Unary(EIrOp::Abs, kIrNone);
+        case vm::EFastFunc::ToString:    return Leaf(EIrType::Str, 1, 1);
+        case vm::EFastFunc::MathMax:     return Leaf(EIrType::Num, 1, 8);
+        case vm::EFastFunc::MathMin:     return Leaf(EIrType::Num, 1, 8);
+        case vm::EFastFunc::StringLen:   return Leaf(EIrType::Num, 1, 1);
+        case vm::EFastFunc::StringSub:   return Leaf(EIrType::Str, 2, 3);
+        case vm::EFastFunc::StringChar:  return Leaf(EIrType::Str, 1, 8);
+        case vm::EFastFunc::TableConcat: return Leaf(EIrType::Str, 1, 3);
+        case vm::EFastFunc::TableInsert: return Leaf(EIrType::Nil, 2, 3);
         default: return false;
     }
     (void)pNext;
@@ -1594,7 +1632,8 @@ bool C_TraceJit::RecordCall(const BcIns_t& ins, const BcIns_t* pNext) {
     const IrRef rFunc = SlotRef(nB + static_cast<std::int32_t>(uA));
     if (rFunc == kIrNone) return false;
     if (!IsConstRef(rFunc)) {
-        if (pProto->m_uUpvalCount == 0) {
+        static const bool bNoPcGuard = std::getenv("LJX_NOPCGUARD") != nullptr;
+        if (!bNoPcGuard && pProto->m_uUpvalCount == 0) {
             // An upvalue-free closure IS its bytecode: guard the dispatch PC
             // instead of the closure identity, and a callback recreated on
             // every iteration stays on the trace.

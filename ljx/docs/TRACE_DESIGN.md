@@ -57,25 +57,54 @@ back-edge marker).
 | observed | recorded as |
 |----------|-------------|
 | slot holds a number | `SLoad` + number guard; later reads reuse the ref |
-| table array element in range | index guard + `ALoad` |
-| table hash hit at its main position | `HRefK` (constant node index) + key guard + `HLoad` |
-| **method lookup that misses the receiver and resolves through `__index`** | guard receiver's metatable identity + both table versions, then the result is a **constant** |
+| table array element in range | exactness guard on the index, unsigned bound guard, `LoadTV` |
+| hash lookup, any string key | main position from the **loaded** mask and the key's string id; node key guard; `LoadTV` |
+| key absent from the receiver | the same walk, ending in a chain-terminator guard — absence is **proved**, not assumed |
+| method resolved through `__index` above a proved miss | guards on the metatable's identity and the two tables' versions; the result is then a **constant** |
 | constant callee | inline the callee's bytecode into the trace |
 
-The method-lookup row is the important one: it is the shape of every call in
-OO Lua, and the interpreter's inline cache has already established exactly the
-predicate that makes it foldable — identity plus version of the two tables
-involved. Under those guards the resolved method is a compile-time constant,
-which in turn makes the call site monomorphic and inlinable.
+Two of these rows deserve their exact wording.
+
+**The hash walk is real code, not a fold.** The main position is computed the
+way the runtime computes it, from the mask loaded out of the table and the id
+loaded out of the key. Nothing is guarded about the table's shape, so one trace
+serves every instance of a class and survives a rehash instead of exiting on
+one. A constant node index would have needed a mask guard and would have been
+wrong without one — the node array is reallocated on growth, and an empty hash
+part aliases a shared one-node sentinel.
+
+**Only the resolution above the miss is folded.** It is tempting to state the
+predicate as "metatable identity plus both versions" and delete the receiver
+lookup entirely. That is unsound: neither version belongs to the receiver, so
+an instance that acquires its own binding for the key — a per-instance method
+override, a memoized field — would be ignored and the trace would keep
+returning the class's value forever. The receiver's own version cannot be added
+to the predicate either; that would pin the trace to a single object. So the
+receiver's chain stays as guarded code and only what sits above it folds.
+`tests/lua/trace.lua` installs an override mid-loop and checks the trace
+notices.
 
 ## 5. Inlining calls
 
-Recording continues through a call to a Lua function whose identity is
-constant under guards. The recorder pushes a frame (base offset `+= A + 2`) and
-keeps going; `Ret` pops it. A trace therefore spans many Lua frames, which is
-what removes call overhead from method-heavy code.
+Recording continues through a call to a Lua function whose identity is constant
+under a guard. The recorder does not model the frame itself — it reads the
+base the interpreter is actually running on, so the frame chain follows for
+free — and the two words a call writes (the callee at `base-2`, the link at
+`base-1`) are ordinary slot assignments whose values are trace constants. A
+snapshot therefore reconstructs every inlined frame without any special
+machinery, and a trace spans many Lua frames.
 
-## 6. Snapshots and exits
+## 6. Snapshots, exits, and the two kinds of slot
+
+A slot that is **read before it is written** gets an entry `SLoad`, is carried
+in a register across the back edge, and appears in every snapshot from that
+point on. A slot that is **only ever written** is not carried in a register at
+all; it is stored to the Lua stack once, at the back edge. That single store is
+what makes deoptimization exact without a loop-carry analysis: a guard *after*
+the assignment is covered by the snapshot, and a guard *before* it needs
+whatever the previous iteration left in the slot — which is exactly what the
+back-edge store put there.
+
 
 Every guard is associated with a snapshot: the list of
 (slot index, IR ref) pairs that are live, plus the resume PC and frame depth.
@@ -100,19 +129,62 @@ Guard elimination is the one that matters most: in a loop body the same
 receiver type, metatable and versions are re-checked on every iteration by the
 interpreter, and the trace checks them once.
 
-## 8. Register allocation and code
+## 8. Loop-invariant hoisting
 
-Linear scan over the finished IR: numbers to xmm, tagged values and pointers to
-GP registers, spilling to a native frame when pressure demands. Guards emit a
-conditional branch to a per-snapshot exit stub. The loop back-edge becomes a
-real backwards jump, so an iteration executes with no dispatch, no type checks
-that were already proven, and no call overhead for inlined frames.
+The IR is emitted in three groups: the entry `SLoad`s, then everything whose
+operands are loop-invariant, then the body. For a field access on an invariant
+receiver the second group absorbs the entire address computation — mask load,
+node-array load, main-position arithmetic, node address, and the node **key**
+load with its guard, since a raw store rewrites a node's value word and never
+its key. What is left in the loop is the value load, its type guard, the
+arithmetic, and the store.
 
-## 9. Safety obligations
+Three rules keep it sound:
 
-* **GC.** Compiled code may allocate (table stores can grow). Every point that
-  can allocate is a safe point: live values are written back to the Lua stack
-  first, exactly as a snapshot restore would.
+* a stack slot is invariant only when the recorded iteration left it holding
+  the value it was entered with;
+* only header words a trace can never write are hoistable loads — array,
+  metatable, next, node array, array size, hash mask. The version word is
+  excluded, because a hash store bumps it;
+* a guard that moves into the pre-roll is re-pointed at the entry snapshot. It
+  runs before the body has changed anything, so resuming at the trace head with
+  the interpreter's own state is always correct.
+
+## 9. Register allocation and code
+
+Linear scan over the reordered IR: numbers to xmm, tagged values and pointers
+to GP registers, spilling to a native frame when pressure demands. Guards emit
+a conditional branch to a per-snapshot exit stub that writes the live values
+back to the Lua stack and returns the exit number.
+
+Anything whose definition runs **once** — the entry loads and everything
+hoisted — stays live across the back edge, or the next iteration would read a
+register that the body has since reused. Hoisted values may still spill, but
+their spill store is emitted at the *definition*, in the pre-roll: emitting it
+at the eviction point would place it inside the loop, where on the second
+iteration the register holds something else and the store would corrupt the
+home slot. Entry loads are never spilled at all, because the back-edge copies
+write to their registers.
+
+## 10. Safety obligations
+
+* **GC.** Compiled traces do not allocate at all — anything that could
+  (a table constructor, a closure, a new table key, a concat, a C call) aborts
+  recording — so no collection can begin while a trace is running. Two things
+  still have to be arranged. The interpreter raises the thread's high-water
+  mark past the highest slot a trace touches when the trace returns, since a
+  trace writes inlined frames that no `FuncF` ever accounted for. And every GC
+  object a trace bakes an address into — a compared constant, a metatable whose
+  version word it reads, an upvalue whose cell it loads — is anchored in the
+  registry, which is an ordinary GC root; a stale object then fails a guard
+  instead of being dereferenced after free.
+* **Recording is not re-entrant.** A metamethod or C function that calls back
+  into the interpreter would otherwise have its bytecodes appended to the trace
+  with a bogus frame base, so `C_Interpreter::Call` aborts an in-progress
+  recording. For the same reason the loop and function tiers, and the
+  collector's step check, stand down while the recorder is running: a tier that
+  executes a whole loop or function natively would hide those bytecodes from
+  it.
 * **Deoptimization must be exact.** The differential test (`LJX_NOJIT=1`)
   compares compiled and interpreted output byte-for-byte on every script; a
   trace that restores the wrong state fails it.

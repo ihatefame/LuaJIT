@@ -2,8 +2,10 @@
 
 LJX is a clean-room Lua 5.1 VM built in modern C++20, following the architecture
 in [`ARCHITECTURE.md`](ARCHITECTURE.md). This tree is a **working interpreter
-plus a native-code compiler for hot numeric loops** (roadmap phases 0–2, and
-the first increment of phase 3).
+plus three native-code tiers**: a loop JIT and a whole-function JIT for the
+shapes they recognize, and a **trace compiler** that records whatever actually
+executes and specializes on the types it observes (roadmap phases 0–2 and most
+of phase 3).
 
 ## What works today
 
@@ -55,6 +57,13 @@ A complete, self-contained Lua front-end and runtime:
   setmetatable getmetatable rawget rawset assert error pcall collectgarbage`,
   plus `math`, `string` (`len sub rep byte char`, method syntax), `table`
   (`insert remove`), `os.clock/time`, `io.write`.
+
+- **Trace compiler** — hot back edges are recorded through a dispatch-table
+  swap, lowered to a linear typed SSA IR, hoisted, register-allocated and
+  emitted as x86-64 with per-snapshot side exits. Records arithmetic,
+  comparisons, array and hash access (including variable string keys),
+  `__index` method dispatch, upvalue and global reads, and inlines calls whose
+  callee is constant under a guard.
 
 ### Not yet implemented
 
@@ -167,16 +176,16 @@ covered by tests that fail loudly without the fix:
 
 ## Benchmarks
 
-Best-of-7, this machine, against the LuaJIT 2.1 built in `../src`:
+Best-of-5, this machine, against the LuaJIT 2.1 built in `../src`:
 
 | bench | LJX | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
 |-------|----:|---------------:|-----------:|-------------:|-----------:|
-| fib   | **0.061s** | 0.335s | **5.45× faster** | 0.063s | **0.98× — faster** |
-| loop  | **0.075s** | 0.327s | **4.39× faster** | 0.062s | 1.21× |
-| array | **0.0094s** | 0.041s | **4.35× faster** | 0.0073s | 1.28× |
-| tab   | **0.027s** | 0.069s | **2.58× faster** | 0.033s | **0.80× — faster** |
-| str   | **0.126s** | 0.142s | **1.13× faster** | 0.063s | 1.98× |
-| real  | 0.051s | 0.049s | 0.95× | 0.0029s | 17.7× |
+| fib   | **0.063s** | 0.346s | **5.52× faster** | 0.066s | **0.95× — faster** |
+| loop  | **0.076s** | 0.353s | **4.64× faster** | 0.062s | 1.22× |
+| array | **0.0099s** | 0.041s | **4.16× faster** | 0.0078s | 1.28× |
+| tab   | **0.027s** | 0.067s | **2.50× faster** | 0.033s | **0.83× — faster** |
+| str   | **0.133s** | 0.147s | **1.10× faster** | 0.068s | 1.97× |
+| real  | **0.0068s** | 0.048s | **7.07× faster** | 0.0028s | 2.42× |
 
 Reading this honestly:
 
@@ -184,41 +193,66 @@ Reading this honestly:
   LuaJIT's full trace compiler, and the reason is a strategy difference, not
   raw codegen: pre-growing the array once at loop entry avoids the incremental
   reallocation LuaJIT does as the table grows.
-- **`array`** and **`loop`** are 4.3× faster than LuaJIT's hand-written
-  assembly interpreter and land within **1.22–1.25×** of its trace compiler.
-- **`str`** edges past the assembly interpreter thanks to an allocation-free
-  concat path and a hand-rolled integer formatter.
-- **`fib`** went from 0.434s to **0.062s** once the function JIT landed — 5.4×
-  faster than LuaJIT's assembly interpreter and level with its trace compiler.
-  Recursion is now real machine recursion.
+- **`array`** and **`loop`** are 4.2× faster than LuaJIT's hand-written
+  assembly interpreter and land within **1.22–1.28×** of its trace compiler.
+- **`fib`** is level with LuaJIT's trace compiler. Recursion is real machine
+  recursion.
+- **`real`** — objects with methods, `__index` dispatch, string-keyed
+  dictionaries — was **17.7× behind** LuaJIT's trace compiler before the trace
+  tier existed and is **2.4×** behind now. See below.
 - **`str`** is the remaining soft spot: string building still allocates and
-  interns per operation, which the JIT does not touch.
+  interns per operation, and no tier touches it.
 
-### Where the JIT does *not* reach — and what that costs
+### The three tiers, measured separately
 
-`real` is deliberately in the table: objects with methods, string-keyed
-dictionaries, nested tables. **Both JIT tiers reject every region in it** —
-the loop JIT because the bodies contain calls and string-keyed access, the
-function JIT because the functions touch tables. So `real` measures the
-interpreter alone, and against LuaJIT's trace compiler that is a **17.7× gap**.
+`LJX_NOLOOPJIT=1` and `LJX_NOFUNCJIT=1` disable the two pattern tiers, so each
+can be measured on its own. That gives an uncomfortable but useful number:
 
-That number is the honest state of this project. The two tiers are pattern
-matchers: they are fast on the shapes they recognize and contribute nothing
-elsewhere. Closing it needs the tier `ARCHITECTURE.md` actually specifies — a
-trace compiler that records whatever executes, specializes on observed types,
-and side-exits on a guard failure — because that mechanism is indifferent to
-the *shape* of the code it compiles.
+| bench | all tiers | trace tier only | LuaJIT `-joff` |
+|-------|----------:|----------------:|---------------:|
+| loop  | 0.076s | 0.101s | 0.353s |
+| array | 0.0099s | 0.020s | 0.041s |
+| tab   | 0.027s | 0.076s | 0.067s |
+| real  | 0.0068s | 0.0067s | 0.048s |
 
-What has been done for `real` so far is architectural rather than
-pattern-matched, and applies everywhere: link-time optimization (so runtime
-fast paths inline into interpreter handlers), inline caches for
-metatable-resolved lookups, and raw-store fast paths for table writes. Together
-they took it from 0.075s to 0.051s — from 1.55× *slower* than LuaJIT's assembly
-interpreter to 0.95× of it — without a line of code that knows what a benchmark
-looks like.
+On counted numeric loops the pattern tiers are still **1.3× to 2.8× ahead** of
+the trace tier, which is why they keep their precedence. What the trace tier
+buys is that it has no shape requirement at all: on `real` it is the only tier
+that fires, and it is the whole difference between 0.048s and 0.0068s.
+
+### What each tier can and cannot do
+
+The **loop JIT** recognizes a counted numeric `for` whose body is arithmetic
+and array access. The **function JIT** recognizes a *numeric-closed* function —
+numbers in, numbers throughout — and compiles it to a plain native
+`double f(double, …)`, so recursion becomes a native `call`. Both are pattern
+matchers: fast on the shape they recognize, silent everywhere else.
+
+The **trace compiler** recognizes nothing. It records the bytecodes that
+actually execute at a hot back edge, specializes on the types actually
+observed, and leaves through a side exit when an assumption breaks. It inlines
+calls whose callee is constant under a guard, so a trace spans many Lua frames.
+`docs/TRACE_DESIGN.md` describes the mechanism; the part that makes it general
+rather than a fourth pattern matcher is worth stating here:
+
+> A field access on a class-style object misses on the receiver and resolves
+> through the metatable's `__index`. The receiver's own hash chain is emitted
+> as **real guarded code** — main position computed from the loaded mask and
+> the key's string id, node key compares, chain-terminator guard — so an
+> instance that later acquires that field leaves the trace instead of being
+> ignored. Only the metatable resolution *above* that miss is folded to a
+> constant, under guards on the metatable's identity and the two tables'
+> versions. That constant is what makes the call site monomorphic and
+> inlinable.
+
+What the trace tier still refuses: varargs, `pcall`, coroutines, string
+concatenation, `#`, anything that allocates (a table constructor, a closure, a
+new table key), C functions, and metamethods other than a table `__index`.
+Those abort recording and blacklist the loop.
 
 Every benchmark result is checked against the interpreter (`LJX_NOJIT=1`) and
-must match exactly.
+must match exactly. `tests/lua/trace.lua` additionally checks the trace tier
+against LuaJIT's own output, line for line.
 
 **A note on `preserve_none`.** The architecture calls for it, and the code is
 written to use it, but clang 18 does not implement the attribute — the macro

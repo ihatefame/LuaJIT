@@ -215,6 +215,21 @@ public:
         U32(u);
     }
 
+    // cmp dword [base+disp32], imm32   81 /7 id
+    void CmpMem32Imm(std::uint8_t uBase, std::int32_t nDisp, std::uint32_t u) {
+        RexRegRm(7, uBase, false);
+        U8(0x81);
+        ModRmDisp(7, uBase, nDisp);
+        U32(u);
+    }
+    // shr r32, imm8   C1 /5 ib
+    void ShrR32(std::uint8_t uGpr, std::uint8_t uBits) {
+        if (uGpr >= 8) U8(0x41);
+        U8(0xC1);
+        U8(static_cast<std::uint8_t>(0xE8 | (uGpr & 7)));
+        U8(uBits);
+    }
+
     // cvttsd2si r32, [rdi+disp32]   F2 [REX] 0F 2C /r (mod=10)
     void Cvttsd2siMem(std::uint8_t uGpr, std::uint8_t uBase, std::int32_t nDisp) {
         U8(0xF2);

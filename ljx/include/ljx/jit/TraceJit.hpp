@@ -108,6 +108,14 @@ private:
     [[nodiscard]] IrRef Constant(const vm::TValue_t& tvValue);
     [[nodiscard]] IrRef ConstantNum(double flValue);
     [[nodiscard]] IrRef Materialize(IrRef rRef);
+    // Emit + attach a deopt snapshot ONLY when the instruction is new. A CSE
+    // hit must keep its original snapshot: the guard executes at its first
+    // position, and a later snapshot could name values not yet computed there.
+    [[nodiscard]] IrRef EmitSnapped(EIrOp eOp, EIrType eType, IrRef rOp1, IrRef rOp2,
+                                    const vm::BcIns_t* pResumePc);
+    [[nodiscard]] bool IsIntegralNum(IrRef rRef) const noexcept;
+    void MarkIntegral(IrRef rRef) noexcept;
+    [[nodiscard]] bool GuardEntryInt32(IrRef rRef, const vm::BcIns_t* pResumePc);
     [[nodiscard]] IrRef ConstantInt(std::int64_t nValue);
     [[nodiscard]] IrRef ConstantPtr(const void* pPtr);
     [[nodiscard]] std::uint32_t TakeSnapshot(const vm::BcIns_t* pResumePc);
@@ -158,6 +166,8 @@ private:
     std::int32_t m_nTopSlot = 0;
     std::vector<IrIns_t> m_vIns;                    // instructions (index + kIrBias = ref)
     std::vector<std::uint16_t> m_vInsSnap;          // guard -> snapshot index
+    std::vector<std::uint8_t> m_vIntegral;          // ref -> provably exact int32-ish
+    std::vector<std::uint8_t> m_vForceHoist;        // ref -> emit in the preamble
     std::vector<IrConst_t> m_vConst;                // constants (kIrBias - 1 - index = ref)
     std::vector<Snapshot_t> m_vSnapshots;
     std::vector<SnapSlot_t> m_vSnapSlots;

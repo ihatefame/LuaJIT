@@ -38,6 +38,9 @@ check trace "$(printf 'dot\t2200\noverride\tclass\tclass\tinstance\tinstance\nin
 # Loop-carried slots: a snapshot taken before a slot's first read must still
 # name it, or a side exit resumes the interpreter with a stale loop index.
 check trace_loopcarry "$(printf '250000\n500\t500\n500\t500\n500\t500\n80200\t240600\n11286\t11629\t53431275\t40000\n6')"
+# Narrowing: hoisted int32 entry guards replace per-iteration exactness
+# checks; fractional entries and huge bounds must fall back exactly.
+check trace_narrow "$(printf '0\n199\n45450\t11\n297000\n80199\n41')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
 # script in tests/lua is run both ways and the outputs compared.

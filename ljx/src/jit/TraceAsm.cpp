@@ -82,10 +82,11 @@ public:
     C_TraceAsm(const std::vector<IrIns_t>& vIns, const std::vector<std::uint16_t>& vInsSnap,
                const std::vector<IrConst_t>& vConst, const std::vector<Snapshot_t>& vSnap,
                const std::vector<SnapSlot_t>& vSnapSlots, const std::vector<IrRef>& vSlotValue,
-               const std::vector<IrRef>& vSlotEntry, std::int32_t nSlotBias) noexcept
+               const std::vector<IrRef>& vSlotEntry, const std::vector<std::uint8_t>& vForce,
+               std::int32_t nSlotBias) noexcept
         : m_vIns(vIns), m_vInsSnap(vInsSnap), m_vConst(vConst), m_vSnap(vSnap),
           m_vSnapSlots(vSnapSlots), m_vSlotValue(vSlotValue), m_vSlotEntry(vSlotEntry),
-          m_nSlotBias(nSlotBias) {}
+          m_vForceHoist(vForce), m_nSlotBias(nSlotBias) {}
 
     [[nodiscard]] bool Run();
 
@@ -134,6 +135,7 @@ private:
     const std::vector<SnapSlot_t>& m_vSnapSlots;
     const std::vector<IrRef>& m_vSlotValue;
     const std::vector<IrRef>& m_vSlotEntry;
+    const std::vector<std::uint8_t>& m_vForceHoist;
     std::int32_t m_nSlotBias;
 
     std::vector<std::size_t> m_vOrder;      // emission order (SLoads hoisted)
@@ -192,6 +194,13 @@ void C_TraceAsm::ComputeInvariance() {
 
     for (std::size_t uI = 0; uI < uCount; ++uI) {
         const IrIns_t& ins = m_vIns[uI];
+        // Entry-state guards (ChkInt32 narrowing checks) belong to the
+        // preamble by construction: they guard trace-ENTRY values, so running
+        // them once and exiting through snapshot 0 is exactly their meaning.
+        if (m_vForceHoist[uI]) {
+            m_vInvariant[uI] = 1;
+            continue;
+        }
         bool bInv = false;
         switch (ins.eOp) {
             case EIrOp::SLoad:
@@ -451,23 +460,26 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
 
         case EIrOp::SLoad: {
             const std::int32_t nDisp = SlotDisp(ins.rOp1);
-            m_Emit.MovLoadR64(kGprScratch[1], kRegBase, nDisp);
-            m_Emit.MovR64R64(kGprScratch[0], kGprScratch[1]);
-            m_Emit.SarR64(kGprScratch[0], 47);
-            const std::uint32_t uExit = BeginExit(uSnap);
             if (ins.eType == EIrType::Num) {
-                m_Emit.CmpR32Imm(kGprScratch[0],
-                                 static_cast<std::uint32_t>(vm::EValueTag::NumInt));
+                // Every boxed non-double sorts at or above 0xFFF9''0000''0000''0000,
+                // so ONE compare against the high dword classifies "double" —
+                // no scratch registers, and the value loads straight into xmm.
+                m_Emit.CmpMem32Imm(kRegBase, nDisp + 4, 0xFFF90000u);
+                const std::uint32_t uExit = BeginExit(uSnap);
                 AddPatch(uExit, m_Emit.Jcc(kCcAe));
-            } else {
-                m_Emit.CmpR32Imm(kGprScratch[0], TagFor(ins.eType));
-                AddPatch(uExit, m_Emit.Jcc(kCcNe));
+                if (!Allocate(uIdx, true, uDst)) return false;
+                m_Emit.MovsdLoad(uDst, kRegBase, nDisp);
+                return true;
             }
-            if (!Allocate(uIdx, bFloat, uDst)) return false;
-            if (bFloat)
-                m_Emit.MovqXmmR64(uDst, kGprScratch[1]);
-            else
-                m_Emit.MovR64R64(uDst, kGprScratch[1]);
+            // GC/primitive tags: the tag is the top 17 bits, so shift the
+            // payload bleed out of the high dword and compare once.
+            m_Emit.MovLoadR32Mem(kGprScratch[0], kRegBase, nDisp + 4);
+            m_Emit.ShrR32(kGprScratch[0], 15);
+            m_Emit.CmpR32Imm(kGprScratch[0], TagFor(ins.eType) & 0x1FFFFu);
+            const std::uint32_t uExit = BeginExit(uSnap);
+            AddPatch(uExit, m_Emit.Jcc(kCcNe));
+            if (!Allocate(uIdx, false, uDst)) return false;
+            m_Emit.MovLoadR64(uDst, kRegBase, nDisp);
             return true;
         }
 
@@ -581,7 +593,25 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             const std::uint8_t uA = OperandXmm(ins.rOp1, 0);
             if (!Allocate(uIdx, false, uDst)) return false;
             m_Emit.Cvttsd2si(uDst, uA, true);
-            m_Emit.Cvtsi2sd(kXmmTemp, uDst, true);
+            if (uSnap != 0xffff) {
+                // Exactness unproven: guard the round-trip. A snapshot-less
+                // ToInt means the recorder proved integrality by induction
+                // (ChkInt32 in the preamble), so the conversion is exact.
+                m_Emit.Cvtsi2sd(kXmmTemp, uDst, true);
+                m_Emit.Ucomisd(kXmmTemp, uA);
+                const std::uint32_t uExit = BeginExit(uSnap);
+                AddPatch(uExit, m_Emit.Jcc(kCcNe));
+                AddPatch(uExit, m_Emit.Jcc(kCcP));
+            }
+            return true;
+        }
+
+        case EIrOp::ChkInt32: {
+            // 32-bit truncate + widen back: any value that is not an exact
+            // int32 — fractional, out of range, or NaN — fails the compare.
+            const std::uint8_t uA = OperandXmm(ins.rOp1, 0);
+            m_Emit.Cvttsd2si(kGprScratch[0], uA, false);
+            m_Emit.Cvtsi2sd(kXmmTemp, kGprScratch[0], false);
             m_Emit.Ucomisd(kXmmTemp, uA);
             const std::uint32_t uExit = BeginExit(uSnap);
             AddPatch(uExit, m_Emit.Jcc(kCcNe));
@@ -696,25 +726,23 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
 
         case EIrOp::LoadTV: {
             const std::uint8_t uA = OperandGpr(ins.rOp1, 0);
-            m_Emit.MovLoadR64(kGprScratch[1], uA, 0);
-            if (ins.eType != EIrType::Int) {
-                m_Emit.MovR64R64(kGprScratch[0], kGprScratch[1]);
-                m_Emit.SarR64(kGprScratch[0], 47);
+            if (ins.eType == EIrType::Num) {
+                m_Emit.CmpMem32Imm(uA, 4, 0xFFF90000u);
                 const std::uint32_t uExit = BeginExit(uSnap);
-                if (ins.eType == EIrType::Num) {
-                    m_Emit.CmpR32Imm(kGprScratch[0],
-                                     static_cast<std::uint32_t>(vm::EValueTag::NumInt));
-                    AddPatch(uExit, m_Emit.Jcc(kCcAe));
-                } else {
-                    m_Emit.CmpR32Imm(kGprScratch[0], TagFor(ins.eType));
-                    AddPatch(uExit, m_Emit.Jcc(kCcNe));
-                }
+                AddPatch(uExit, m_Emit.Jcc(kCcAe));
+                if (!Allocate(uIdx, true, uDst)) return false;
+                m_Emit.MovsdLoad(uDst, uA, 0);
+                return true;
             }
-            if (!Allocate(uIdx, bFloat, uDst)) return false;
-            if (bFloat)
-                m_Emit.MovqXmmR64(uDst, kGprScratch[1]);
-            else
-                m_Emit.MovR64R64(uDst, kGprScratch[1]);
+            if (ins.eType != EIrType::Int) {
+                m_Emit.MovLoadR32Mem(kGprScratch[1], uA, 4);
+                m_Emit.ShrR32(kGprScratch[1], 15);
+                m_Emit.CmpR32Imm(kGprScratch[1], TagFor(ins.eType) & 0x1FFFFu);
+                const std::uint32_t uExit = BeginExit(uSnap);
+                AddPatch(uExit, m_Emit.Jcc(kCcNe));
+            }
+            if (!Allocate(uIdx, false, uDst)) return false;
+            m_Emit.MovLoadR64(uDst, uA, 0);
             return true;
         }
 
@@ -790,6 +818,7 @@ bool C_TraceAsm::RunOnce() {
         const std::size_t uI = m_vOrder[uP];
         if (!bAtLoopTop && uP >= m_uHoisted) {
             bAtLoopTop = true;
+            while (m_Emit.Here() & 15) m_Emit.U8(0x90);   // align the loop top
             m_uLoopTop = m_Emit.Here();
         }
         m_uPos = uP;
@@ -814,7 +843,10 @@ bool C_TraceAsm::RunOnce() {
             }
         }
     }
-    if (!bAtLoopTop) m_uLoopTop = m_Emit.Here();
+    if (!bAtLoopTop) {
+        while (m_Emit.Here() & 15) m_Emit.U8(0x90);
+        m_uLoopTop = m_Emit.Here();
+    }
     const std::size_t uBackEdge = m_Emit.Jmp();
     m_Emit.PatchTo(uBackEdge, m_uLoopTop);
 
@@ -894,7 +926,7 @@ std::uint8_t* C_TraceJit::AllocCode(std::size_t uBytes) {
 
 Trace_t* C_TraceJit::Assemble() {
     C_TraceAsm asmb(m_vIns, m_vInsSnap, m_vConst, m_vSnapshots, m_vSnapSlots, m_vSlotValue,
-                    m_vSlotEntry, kSlotBias);
+                    m_vSlotEntry, m_vForceHoist, kSlotBias);
     if (!asmb.Run()) {
         if (TraceDebug()) std::fprintf(stderr, "[trace] backend refused the trace\n");
         return nullptr;

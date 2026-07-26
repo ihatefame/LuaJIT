@@ -54,6 +54,7 @@ enum class EIrType : std::uint8_t {
     X(GuardLt) X(GuardGe) X(GuardLe) X(GuardGt)   /* ordered, non-NaN       */ \
     X(GuardEq) X(GuardNe)        /* 64-bit raw word                         */ \
     X(GuardEqI) X(GuardBelow)    /* 32-bit equal / unsigned below           */ \
+    X(ChkInt32)       /* value is an exact int32 (32-bit cvt round-trip)    */ \
     /* address arithmetic */                                                   \
     X(TabPtr)         /* tagged value  -> untagged 47-bit pointer           */ \
     X(AddK)           /* ptr + constant byte offset                         */ \
@@ -98,7 +99,7 @@ enum class EIrOp : std::uint8_t {
     switch (eOp) {
         case EIrOp::GuardLt: case EIrOp::GuardGe: case EIrOp::GuardLe:
         case EIrOp::GuardGt: case EIrOp::GuardEq: case EIrOp::GuardNe:
-        case EIrOp::GuardEqI: case EIrOp::GuardBelow:
+        case EIrOp::GuardEqI: case EIrOp::GuardBelow: case EIrOp::ChkInt32:
         case EIrOp::SLoad: case EIrOp::LoadTV: case EIrOp::ToInt:
             return true;
         default:

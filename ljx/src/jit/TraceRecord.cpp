@@ -5,6 +5,7 @@
 // live operand values, so it can specialize on the types actually present and
 // emit a guard rather than a test — and it can resolve a metatable lookup at
 // record time and keep only the guards that make the answer a constant.
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -59,6 +60,13 @@ constexpr std::int32_t kNodeSize = static_cast<std::int32_t>(sizeof(vm::TableNod
 constexpr std::int32_t kOfsStrSid = static_cast<std::int32_t>(offsetof(C_GcString, m_uSid));
 
 constexpr std::uint32_t kMaxChainWalk = 4;
+
+// True when a double is an exact 32-bit integer — the precondition under which
+// the induction argument in GuardEntryInt32 holds.
+bool IsInt32Value(double flValue) noexcept {
+    return flValue == std::floor(flValue) && flValue >= -2147483648.0 &&
+           flValue <= 2147483647.0;
+}
 
 }  // namespace
 
@@ -130,6 +138,8 @@ IrRef C_TraceJit::Emit(EIrOp eOp, EIrType eType, IrRef rOp1, IrRef rOp2) {
     m_vIns.push_back(IrIns_t{rOp1, rOp2, eOp, eType,
                              m_vChain[static_cast<std::size_t>(eOp)]});
     m_vInsSnap.push_back(0xffff);
+    m_vIntegral.push_back(0);
+    m_vForceHoist.push_back(0);
     m_vChain[static_cast<std::size_t>(eOp)] = rNew;
     // A store invalidates the load chains: a later load must not be forwarded
     // across it. Truncating the chain is the whole alias analysis.
@@ -146,6 +156,51 @@ IrRef C_TraceJit::EmitGuard(EIrOp eOp, IrRef rOp1, IrRef rOp2, const BcIns_t* pR
     if (rIns == kIrNone || m_vIns.size() == uBefore) return rIns;  // CSE'd: already proven
     m_vInsSnap[rIns - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pResumePc));
     return rIns;
+}
+
+IrRef C_TraceJit::EmitSnapped(EIrOp eOp, EIrType eType, IrRef rOp1, IrRef rOp2,
+                              const BcIns_t* pResumePc) {
+    const std::size_t uBefore = m_vIns.size();
+    const IrRef rIns = Emit(eOp, eType, rOp1, rOp2);
+    if (rIns != kIrNone && m_vIns.size() != uBefore)
+        m_vInsSnap[rIns - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pResumePc));
+    return rIns;
+}
+
+bool C_TraceJit::IsIntegralNum(IrRef rRef) const noexcept {
+    if (rRef == kIrNone) return false;
+    if (IsConstRef(rRef)) {
+        const IrConst_t& k = m_vConst[kIrBias - 1 - rRef];
+        return k.eType == EIrType::Num && IsInt32Value(std::bit_cast<double>(k.uValue));
+    }
+    return m_vIntegral[rRef - kIrBias] != 0;
+}
+
+void C_TraceJit::MarkIntegral(IrRef rRef) noexcept {
+    if (rRef != kIrNone && !IsConstRef(rRef)) m_vIntegral[rRef - kIrBias] = 1;
+}
+
+// Narrowing. The IR keeps Lua numbers as doubles, so an array index costs a
+// cvttsd2si plus a round-trip exactness guard on EVERY use — the biggest
+// per-iteration tax the trace tier pays next to LuaJIT's integer IR. The
+// escape is an induction argument: if a value is an exact int32 at trace
+// ENTRY, and everything added to it is integral with the loop guard bounding
+// its growth, it stays exact forever. So this emits ONE hoisted 32-bit
+// round-trip check in the preamble (out-of-range and NaN both fail it), marks
+// the ref integral, and every downstream ToInt drops its per-iteration guard.
+bool C_TraceJit::GuardEntryInt32(IrRef rRef, const BcIns_t* pResumePc) {
+    if (rRef == kIrNone) return false;
+    if (IsIntegralNum(rRef)) return true;
+    if (IsConstRef(rRef)) return false;
+    const std::size_t uBefore = m_vIns.size();
+    const IrRef rChk = Emit(EIrOp::ChkInt32, EIrType::Nothing, rRef, kIrNone);
+    if (rChk == kIrNone) return false;
+    if (m_vIns.size() != uBefore) {
+        m_vInsSnap[rChk - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pResumePc));
+        m_vForceHoist[rChk - kIrBias] = 1;
+    }
+    MarkIntegral(rRef);
+    return m_eState == ETraceState::Recording;
 }
 
 // A compiled trace outlives any Lua reference to the objects it specialized
@@ -178,7 +233,10 @@ IrRef C_TraceJit::ConstantNum(double flValue) { return Constant(TValue_t::Number
 // every iteration.
 IrRef C_TraceJit::Materialize(IrRef rRef) {
     if (rRef == kIrNone || !IsConstRef(rRef)) return rRef;
-    return Emit(EIrOp::KLoad, TypeOf(rRef), rRef, kIrNone);
+    const bool bIntegral = IsIntegralNum(rRef);
+    const IrRef rNew = Emit(EIrOp::KLoad, TypeOf(rRef), rRef, kIrNone);
+    if (bIntegral) MarkIntegral(rNew);
+    return rNew;
 }
 
 IrRef C_TraceJit::ConstantInt(std::int64_t nValue) {
@@ -276,6 +334,8 @@ void C_TraceJit::StartRecording(const BcIns_t* pPc, TValue_t* pBase, const TValu
     m_nTopSlot = 0;
     m_vIns.clear();
     m_vInsSnap.clear();
+    m_vIntegral.clear();
+    m_vForceHoist.clear();
     m_vConst.clear();
     m_vSnapshots.clear();
     m_vSnapSlots.clear();
@@ -285,6 +345,22 @@ void C_TraceJit::StartRecording(const BcIns_t* pPc, TValue_t* pBase, const TValu
     m_vSlotEntry.assign(static_cast<std::size_t>(kMaxSlot + kSlotBias), kIrNone);
     // Exit 0 is the entry guard: nothing live, resume at the trace head.
     (void)TakeSnapshot(pPc);
+    // A head that follows a ForI is a numeric for-loop. When the control
+    // triple is integral int32, guard exactly that once in the preamble and
+    // the whole loop narrows: entry-exact + integral step + the loop bound
+    // keeps the index exact on every iteration (see GuardEntryInt32).
+    const BcIns_t insPrev{pPc[-1].uRaw};
+    if (insPrev.Op() == EBcOp::ForI || insPrev.Op() == EBcOp::JForI) {
+        const std::uint32_t uCtl = insPrev.A();
+        bool bAllInt = true;
+        for (std::uint32_t uI = 0; uI < 3; ++uI) {
+            const TValue_t tvCtl = pBase[uCtl + uI];
+            bAllInt &= tvCtl.IsDouble() && IsInt32Value(tvCtl.AsDouble());
+        }
+        if (bAllInt)
+            for (std::uint32_t uI = 0; uI < 4; ++uI)
+                (void)GuardEntryInt32(SlotRef(static_cast<std::int32_t>(uCtl + uI)), pPc);
+    }
     vm::C_Interpreter::SetRecordMode(*m_pUniverse, true);
     if (TraceDebug())
         std::fprintf(stderr, "[trace] start @%p\n", static_cast<const void*>(pPc));
@@ -577,9 +653,9 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
                 core::RefToPtr(m_pUniverse->ArenaBase(), pUpval->m_rValue));
             const EIrType eType = ObservedType(*pCell);
             if (eType == EIrType::Nothing) return false;
-            const IrRef rVal = Emit(EIrOp::LoadTV, eType, ConstantPtr(pCell), kIrNone);
+            const IrRef rVal =
+                EmitSnapped(EIrOp::LoadTV, eType, ConstantPtr(pCell), kIrNone, pNext - 1);
             if (rVal == kIrNone) return false;
-            m_vInsSnap[rVal - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pNext - 1));
             SetSlot(nB + uA, rVal);
             return true;
         }
@@ -600,9 +676,8 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
             const TValue_t* pSlot = pGlobals->GetStr(*m_pUniverse, pStr);
             const EIrType eType = ObservedType(*pSlot);
             if (eType == EIrType::Nothing) return false;
-            const IrRef rVal = Emit(EIrOp::LoadTV, eType, rNode, kIrNone);
+            const IrRef rVal = EmitSnapped(EIrOp::LoadTV, eType, rNode, kIrNone, pNext - 1);
             if (rVal == kIrNone) return false;
-            m_vInsSnap[rVal - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pNext - 1));
             SetSlot(nB + uA, rVal);
             return true;
         }
@@ -664,6 +739,10 @@ bool C_TraceJit::RecordArith(const BcIns_t& ins, EIrOp eOp, int nKind) {
     if (TypeOf(rLeft) != EIrType::Num || TypeOf(rRight) != EIrType::Num) return false;
     const IrRef rRes = Emit(eOp, EIrType::Num, Materialize(rLeft), Materialize(rRight));
     if (rRes == kIrNone) return false;
+    // Sum of two exact int32 is exact (< 2^33 << 2^53); products can round.
+    if ((eOp == EIrOp::Add || eOp == EIrOp::Sub) && IsIntegralNum(rLeft) &&
+        IsIntegralNum(rRight))
+        MarkIntegral(rRes);
     SetSlot(nB + ins.A(), rRes);
     return true;
 }
@@ -758,19 +837,32 @@ bool C_TraceJit::RecordForL(const BcIns_t& ins, const BcIns_t* pNext) {
         TypeOf(rStep) != EIrType::Num)
         return false;
     const double flStep = m_pBase[ins.A() + 2].AsDouble();
+    const double flNew = m_pBase[ins.A()].AsDouble() + flStep;
+    const double flStop = m_pBase[ins.A() + 1].AsDouble();
     const IrRef rNew = Emit(EIrOp::Add, EIrType::Num, rIdx, rStep);
     if (rNew == kIrNone) return false;
-    // The loop continues on the recorded path; the guard's exit resumes at the
-    // instruction after the back edge, i.e. the loop's exit.
-    // The interpreter stores the new index unconditionally and the visible
-    // variable only when the loop continues, so the index update must be
-    // visible to the guard's snapshot and the copy must not be.
+    if (IsIntegralNum(rIdx) && IsIntegralNum(rStep)) MarkIntegral(rNew);
+    // The index update, and the visible copy, must be in the guard's snapshot
+    // BEFORE the guard: the interpreter resuming on either side of the back
+    // edge expects them current. (The copy is dead on the loop-exit side —
+    // the loop variable's scope ends with the loop — so writing it there too
+    // is unobservable and keeps the two directions uniform.)
     SetSlot(nSlot, rNew);
-    (void)EmitGuard(flStep >= 0 ? EIrOp::GuardLe : EIrOp::GuardGe, rNew, Materialize(rStop),
-                    pNext);
-    if (m_eState != ETraceState::Recording) return false;
     SetSlot(nSlot + 3, rNew);
-    return true;
+    const bool bContinue = flStep >= 0 ? flNew <= flStop : flNew >= flStop;
+    if (bContinue) {
+        // Guard that the loop keeps going; the exit resumes past the back edge.
+        (void)EmitGuard(flStep >= 0 ? EIrOp::GuardLe : EIrOp::GuardGe, rNew,
+                        Materialize(rStop), pNext);
+    } else {
+        // The recorded iteration was the loop's LAST: assert the exit
+        // direction, and resume at the body start if the loop continues after
+        // all. Without this split, a trace recorded on a final iteration
+        // would carry a continue-guard in front of post-loop code.
+        (void)EmitGuard(flStep >= 0 ? EIrOp::GuardGt : EIrOp::GuardLt, rNew,
+                        Materialize(rStop), pNext + ins.JumpTarget());
+    }
+    return m_eState == ETraceState::Recording;
 }
 
 // ---------------------------------------------------------------------------
@@ -864,9 +956,11 @@ bool C_TraceJit::RecordTableGet(const BcIns_t& ins, const BcIns_t* pNext, TValue
         IrRef rIdx;
         if (rKeyDynamic != kIrNone) {
             if (TypeOf(rKeyDynamic) != EIrType::Num) return false;
-            rIdx = Emit(EIrOp::ToInt, EIrType::Int, rKeyDynamic, kIrNone);
+            rIdx = IsIntegralNum(rKeyDynamic)
+                       ? Emit(EIrOp::ToInt, EIrType::Int, rKeyDynamic, kIrNone)
+                       : EmitSnapped(EIrOp::ToInt, EIrType::Int, rKeyDynamic, kIrNone,
+                                     pResumePc);
             if (rIdx == kIrNone) return false;
-            m_vInsSnap[rIdx - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pResumePc));
         } else {
             rIdx = ConstantInt(nKey);
         }
@@ -886,9 +980,8 @@ bool C_TraceJit::RecordTableGet(const BcIns_t& ins, const BcIns_t* pNext, TValue
             static_cast<TValue_t*>(core::RefToPtr(m_pUniverse->ArenaBase(), pTab->m_rArray)) + nKey;
         const EIrType eType = ObservedType(*pElem);
         if (eType == EIrType::Nothing) return false;
-        const IrRef rVal = Emit(EIrOp::LoadTV, eType, rElem, kIrNone);
+        const IrRef rVal = EmitSnapped(EIrOp::LoadTV, eType, rElem, kIrNone, pResumePc);
         if (rVal == kIrNone) return false;
-        m_vInsSnap[rVal - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pResumePc));
         SetSlot(nB + ins.A(), rVal);
         return true;
     }
@@ -905,9 +998,8 @@ bool C_TraceJit::RecordTableGet(const BcIns_t& ins, const BcIns_t* pNext, TValue
         if (!pSlot || pSlot->IsNil()) return false;
         const EIrType eType = ObservedType(*pSlot);
         if (eType == EIrType::Nothing) return false;
-        const IrRef rVal = Emit(EIrOp::LoadTV, eType, rNode, kIrNone);
+        const IrRef rVal = EmitSnapped(EIrOp::LoadTV, eType, rNode, kIrNone, pResumePc);
         if (rVal == kIrNone) return false;
-        m_vInsSnap[rVal - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pResumePc));
         SetSlot(nB + ins.A(), rVal);
         return true;
     }
@@ -974,9 +1066,10 @@ bool C_TraceJit::RecordTableSet(const BcIns_t& ins, const BcIns_t* pNext, TValue
         if (ins.Op() == EBcOp::TSetV) {
             const IrRef rKey = SlotRef(nB + static_cast<std::int32_t>(uKeySlot));
             if (TypeOf(rKey) != EIrType::Num) return false;
-            rIdx = Emit(EIrOp::ToInt, EIrType::Int, rKey, kIrNone);
+            rIdx = IsIntegralNum(rKey)
+                       ? Emit(EIrOp::ToInt, EIrType::Int, rKey, kIrNone)
+                       : EmitSnapped(EIrOp::ToInt, EIrType::Int, rKey, kIrNone, pResumePc);
             if (rIdx == kIrNone) return false;
-            m_vInsSnap[rIdx - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pResumePc));
         } else {
             rIdx = ConstantInt(nKey);
         }
@@ -1076,10 +1169,18 @@ bool C_TraceJit::RecordIPairsIter(const BcIns_t& ins, const BcIns_t* pPc) {
     if (static_cast<double>(nNext) != flNext) return false;
     if (static_cast<std::uint64_t>(nNext) >= pTab->m_uArraySize) return false;
 
+    if (IsInt32Value(m_pEntryBase[nA - 1].AsDouble()))
+        (void)GuardEntryInt32(rIdx, pPc);   // control counter: narrow it
+    if (m_eState != ETraceState::Recording) return false;
     const IrRef rNext = Emit(EIrOp::Add, EIrType::Num, rIdx, Materialize(ConstantNum(1.0)));
-    const IrRef rInt = Emit(EIrOp::ToInt, EIrType::Int, rNext, kIrNone);
+    if (IsIntegralNum(rIdx)) MarkIntegral(rNext);
+    IrRef rInt;
+    if (IsIntegralNum(rNext)) {
+        rInt = Emit(EIrOp::ToInt, EIrType::Int, rNext, kIrNone);
+    } else {
+        rInt = EmitSnapped(EIrOp::ToInt, EIrType::Int, rNext, kIrNone, pPc);
+    }
     if (rInt == kIrNone) return false;
-    m_vInsSnap[rInt - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pPc));
     const IrRef rTabPtr = Emit(EIrOp::TabPtr, EIrType::Ptr, rTab, kIrNone);
     const IrRef rSize = Emit(EIrOp::LoadU32, EIrType::Int,
                              Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr, ConstantInt(kOfsTabAsize)),
@@ -1098,10 +1199,10 @@ bool C_TraceJit::RecordIPairsIter(const BcIns_t& ins, const BcIns_t* pPc) {
     const EIrType eType = ObservedType(*pElem);
     // A nil element also ends the iteration; the type guard is what catches it.
     if (eType == EIrType::Nothing || eType == EIrType::Nil) return false;
-    const IrRef rElem = Emit(EIrOp::LoadTV, eType,
-                             Emit(EIrOp::IdxPtr, EIrType::Ptr, rArr, rInt), kIrNone);
+    const IrRef rElem = EmitSnapped(EIrOp::LoadTV, eType,
+                                    Emit(EIrOp::IdxPtr, EIrType::Ptr, rArr, rInt), kIrNone,
+                                    pPc);
     if (rElem == kIrNone) return false;
-    m_vInsSnap[rElem - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pPc));
     SetSlot(nA, rNext);
     SetSlot(nA + 1, rElem);
     return m_eState == ETraceState::Recording;

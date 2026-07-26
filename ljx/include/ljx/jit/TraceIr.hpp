@@ -52,7 +52,8 @@ enum class EIrType : std::uint8_t {
     X(ToNum)          /* int64  -> double                                   */ \
     /* guards: every one of these carries a snapshot (C_TraceJit::m_vInsSnap)*/ \
     X(GuardLt) X(GuardGe) X(GuardLe) X(GuardGt)   /* ordered, non-NaN       */ \
-    X(GuardEq) X(GuardNe)        /* 64-bit raw word                         */ \
+    X(GuardEq) X(GuardNe)        /* 64-bit raw word (GPR operands)          */ \
+    X(GuardFEq) X(GuardFNe)      /* double VALUE equality (NaN, -0 correct) */ \
     X(GuardEqI) X(GuardBelow)    /* 32-bit equal / unsigned below           */ \
     X(ChkInt32)       /* value is an exact int32 (32-bit cvt round-trip)    */ \
     /* address arithmetic */                                                   \
@@ -68,7 +69,8 @@ enum class EIrType : std::uint8_t {
     X(LoadU32)                                                                 \
     X(IncU32)         /* ++*(uint32*)ptr — the table version bump           */ \
     /* control */                                                              \
-    X(Loop)           /* the back edge                                      */
+    X(Loop)           /* the back edge                                      */ \
+    X(End)            /* terminal: write everything back, leave the trace   */
 
 enum class EIrOp : std::uint8_t {
 #define LJX_IR_ENUM(name) name,
@@ -89,6 +91,7 @@ enum class EIrOp : std::uint8_t {
         case EIrOp::SStore:
         case EIrOp::StoreTV:
         case EIrOp::Loop:
+        case EIrOp::End:
             return false;
         default:
             return true;
@@ -99,6 +102,7 @@ enum class EIrOp : std::uint8_t {
     switch (eOp) {
         case EIrOp::GuardLt: case EIrOp::GuardGe: case EIrOp::GuardLe:
         case EIrOp::GuardGt: case EIrOp::GuardEq: case EIrOp::GuardNe:
+        case EIrOp::GuardFEq: case EIrOp::GuardFNe:
         case EIrOp::GuardEqI: case EIrOp::GuardBelow: case EIrOp::ChkInt32:
         case EIrOp::SLoad: case EIrOp::LoadTV: case EIrOp::ToInt:
             return true;

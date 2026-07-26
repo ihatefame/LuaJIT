@@ -154,6 +154,7 @@ private:
     std::uint32_t m_uPos = 0;
     std::size_t m_uCurIdx = 0;
     bool m_bFailed = false;
+    bool m_bLooping = false;
     std::size_t m_uLoopTop = 0;
     std::size_t m_uHoisted = 0;
 };
@@ -208,6 +209,9 @@ void C_TraceAsm::ComputeInvariance() {
                 break;
             case EIrOp::Nop: case EIrOp::SStore: case EIrOp::StoreTV:
             case EIrOp::IncU32: case EIrOp::Loop:
+            // End is unconditional control flow, not a guard: hoisting it
+            // would leave the trace through snapshot 0 before the body ran.
+            case EIrOp::End:
                 break;
             case EIrOp::LoadU32:
                 bInv = IsStableField(ins.rOp1) && Inv(ins.rOp1);
@@ -227,6 +231,7 @@ void C_TraceAsm::ComputeInvariance() {
 
 void C_TraceAsm::ComputeLiveness() {
     const std::size_t uCount = m_vIns.size();
+    m_bLooping = !m_vIns.empty() && m_vIns.back().eOp == EIrOp::Loop;
     ComputeInvariance();
     m_vOrder.reserve(uCount);
     for (std::size_t uI = 0; uI < uCount; ++uI)
@@ -283,18 +288,22 @@ void C_TraceAsm::ComputeLiveness() {
     // iteration. Hoisted values may still SPILL — the home slot is written once
     // and reloading from it inside the loop is always correct — but the entry
     // loads may not, because the back-edge copies write to their registers.
-    for (std::size_t uI = 0; uI < uCount; ++uI) {
-        if (m_vIns[uI].eOp == EIrOp::SLoad) {
-            m_vLastUse[uI] = uEnd;
-            m_vNoSpill[uI] = 1;
-        } else if (m_vInvariant[uI]) {
-            m_vLastUse[uI] = uEnd;
+    // Linear traces (stems/side traces ending in End) have no back edge and
+    // keep natural liveness.
+    if (m_bLooping) {
+        for (std::size_t uI = 0; uI < uCount; ++uI) {
+            if (m_vIns[uI].eOp == EIrOp::SLoad) {
+                m_vLastUse[uI] = uEnd;
+                m_vNoSpill[uI] = 1;
+            } else if (m_vInvariant[uI]) {
+                m_vLastUse[uI] = uEnd;
+            }
         }
-    }
-    for (std::size_t uS = 0; uS < m_vSlotValue.size(); ++uS) {
-        const IrRef rVal = m_vSlotValue[uS];
-        if (rVal == kIrNone || m_vSlotEntry[uS] == kIrNone) continue;
-        Use(rVal, uEnd);
+        for (std::size_t uS = 0; uS < m_vSlotValue.size(); ++uS) {
+            const IrRef rVal = m_vSlotValue[uS];
+            if (rVal == kIrNone || m_vSlotEntry[uS] == kIrNone) continue;
+            Use(rVal, uEnd);
+        }
     }
 }
 
@@ -644,6 +653,31 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             return true;
         }
 
+        case EIrOp::GuardFEq: {
+            // Exit unless the doubles compare EQUAL: jne catches inequality,
+            // jp catches unordered (NaN is never equal).
+            const std::uint8_t uA = OperandXmm(ins.rOp1, 0);
+            const std::uint8_t uB = OperandXmm(ins.rOp2, 1);
+            m_Emit.Ucomisd(uA, uB);
+            const std::uint32_t uExit = BeginExit(uSnap);
+            AddPatch(uExit, m_Emit.Jcc(kCcNe));
+            AddPatch(uExit, m_Emit.Jcc(kCcP));
+            return true;
+        }
+
+        case EIrOp::GuardFNe: {
+            // Exit only when equal AND ordered — ucomisd raises ZF on
+            // unordered too, so parity must skip the equality exit.
+            const std::uint8_t uA = OperandXmm(ins.rOp1, 0);
+            const std::uint8_t uB = OperandXmm(ins.rOp2, 1);
+            m_Emit.Ucomisd(uA, uB);
+            const std::uint32_t uExit = BeginExit(uSnap);
+            const std::size_t uSkip = m_Emit.Jcc(kCcP);
+            AddPatch(uExit, m_Emit.Jcc(kCcE));
+            m_Emit.PatchToHere(uSkip);
+            return true;
+        }
+
         case EIrOp::GuardEq: case EIrOp::GuardNe: {
             const std::uint8_t uA = OperandGpr(ins.rOp1, 0);
             const std::uint8_t uB = OperandGpr(ins.rOp2, 1);
@@ -750,6 +784,14 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             EmitBackEdge();
             return true;
 
+        case EIrOp::End: {
+            // Terminal transfer: write the snapshot back and leave. The chain
+            // loop enters this exit's pChild without touching the interpreter.
+            const std::uint32_t uExit = BeginExit(uSnap);
+            AddPatch(uExit, m_Emit.Jmp());
+            return true;
+        }
+
         default:
             return false;
     }
@@ -818,7 +860,8 @@ bool C_TraceAsm::RunOnce() {
         const std::size_t uI = m_vOrder[uP];
         if (!bAtLoopTop && uP >= m_uHoisted) {
             bAtLoopTop = true;
-            while (m_Emit.Here() & 15) m_Emit.U8(0x90);   // align the loop top
+            if (m_bLooping)
+                while (m_Emit.Here() & 15) m_Emit.U8(0x90);   // align the loop top
             m_uLoopTop = m_Emit.Here();
         }
         m_uPos = uP;
@@ -843,12 +886,11 @@ bool C_TraceAsm::RunOnce() {
             }
         }
     }
-    if (!bAtLoopTop) {
-        while (m_Emit.Here() & 15) m_Emit.U8(0x90);
-        m_uLoopTop = m_Emit.Here();
+    if (!bAtLoopTop) m_uLoopTop = m_Emit.Here();
+    if (m_bLooping) {
+        const std::size_t uBackEdge = m_Emit.Jmp();
+        m_Emit.PatchTo(uBackEdge, m_uLoopTop);
     }
-    const std::size_t uBackEdge = m_Emit.Jmp();
-    m_Emit.PatchTo(uBackEdge, m_uLoopTop);
 
     // --- exit stubs ---------------------------------------------------------
     std::vector<std::size_t> vToEpilogue;
@@ -938,8 +980,12 @@ Trace_t* C_TraceJit::Assemble() {
                             reinterpret_cast<char*>(pCode + asmb.m_Emit.Size()));
     auto* pTrace = new Trace_t;
     pTrace->pCode = pCode;
-    for (const PendingExit_t& exit : asmb.m_vExits)
+    for (std::size_t uE = 0; uE < asmb.m_vExits.size(); ++uE) {
+        const PendingExit_t& exit = asmb.m_vExits[uE];
         pTrace->vExits.push_back(TraceExit_t{exit.pResumePc, exit.nBaseOffset});
+        if (m_vIns[exit.uIrIdx].eOp == EIrOp::End)
+            pTrace->nLinkExit = static_cast<std::int32_t>(uE);
+    }
     if (TraceDebug())
         for (std::size_t uE = 0; uE < asmb.m_vExits.size(); ++uE)
             std::fprintf(stderr, "[trace]   exit %zu <- ir %zu %s\n", uE,

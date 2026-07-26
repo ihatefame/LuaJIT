@@ -1058,28 +1058,47 @@ struct TraceResume_t {
     TValue_t* pBase;
 };
 
-LJX_NOINLINE TraceResume_t RunTrace(const jit::Trace_t* pTrace, TValue_t* pBase,
+LJX_NOINLINE TraceResume_t RunTrace(jit::Trace_t* pTrace, TValue_t* pBase,
                                     C_Universe* pUni) {
-    auto fnTrace = reinterpret_cast<jit::TraceEntry_f>(pTrace->pCode);
-    const std::uint32_t uExit = fnTrace(pBase, pUni->ArenaBase());
-    if (jit::TraceDebug()) {
-        auto* pStats = const_cast<jit::Trace_t*>(pTrace);
-        ++pStats->uEntries;
-        if (pStats->vExitCounts.size() <= uExit) pStats->vExitCounts.resize(uExit + 1);
-        ++pStats->vExitCounts[uExit];
-        if (pStats->uEntries < 12)
-            std::fprintf(stderr, "[trace] #%u entry %llu -> exit %u, resume %s @%p base%+d\n",
-                         pTrace->uNumber,
-                         static_cast<unsigned long long>(pStats->uEntries), uExit,
-                         OpName(pTrace->vExits[uExit].pResumePc->Op()),
-                         static_cast<const void*>(pTrace->vExits[uExit].pResumePc),
-                         pTrace->vExits[uExit].nBaseOffset);
-    }
     C_LuaThread* pThread = pUni->MainThread();
-    TValue_t* pReach = pBase + pTrace->nTopSlot + 1;
-    if (pReach > pThread->m_pHighWater) pThread->m_pHighWater = pReach;
-    const jit::TraceExit_t& exit = pTrace->vExits[uExit];
-    return TraceResume_t{exit.pResumePc, pBase + exit.nBaseOffset};
+    // The chain loop: a trace's exit either returns to the interpreter or
+    // names a CHILD — a side trace grown from that exit, or the loop trace a
+    // stem/side trace links back into. Execution ping-pongs between compiled
+    // segments here with no interpreter dispatch in between; the seam cost is
+    // one call plus the snapshot write-back/reload through L1.
+    for (;;) {
+        ++pTrace->uEntries;
+        auto fnTrace = reinterpret_cast<jit::TraceEntry_f>(pTrace->pCode);
+        const std::uint32_t uExit = fnTrace(pBase, pUni->ArenaBase());
+        TValue_t* pReach = pBase + pTrace->nTopSlot + 1;
+        if (pReach > pThread->m_pHighWater) pThread->m_pHighWater = pReach;
+        jit::TraceExit_t& exit = pTrace->vExits[uExit];
+        if (jit::TraceDebug() && pTrace->uEntries <= 8)
+            std::fprintf(stderr, "[trace] #%u entry %llu -> exit %u (%s @%p base%+d)%s\n",
+                         pTrace->uNumber,
+                         static_cast<unsigned long long>(pTrace->uEntries), uExit,
+                         OpName(exit.pResumePc->Op()),
+                         static_cast<const void*>(exit.pResumePc), exit.nBaseOffset,
+                         exit.pChild ? " -> child" : "");
+        pBase += exit.nBaseOffset;
+        if (exit.pChild) {
+            pTrace = exit.pChild;
+            continue;
+        }
+        // Exit heat: a hot exit grows a side trace (or links to an existing
+        // trace at its resume point), so the next time through this path
+        // stays compiled.
+        if (exit.uCount < jit::C_TraceJit::kBlacklistCount &&
+            ++exit.uCount == jit::C_TraceJit::kHotExitThreshold) {
+            const C_GcProto* pProto = FrameProto(pUni, pBase);
+            pUni->TraceJit()->OnHotExit(pTrace, uExit, pBase, KBaseOf(pUni, pProto));
+            if (jit::TraceExit_t& re = pTrace->vExits[uExit]; re.pChild) {
+                pTrace = re.pChild;
+                continue;
+            }
+        }
+        return TraceResume_t{exit.pResumePc, pBase};
+    }
 }
 
 // Turns a loop op into its J-variant once a trace exists for it, so the entry
@@ -1106,7 +1125,7 @@ LJX_H(ForL) {
         if (pUni->HotCounts().DecrementLoop(pPc) && pUni->TraceJit() &&
             !pUni->m_uRecording) [[unlikely]] {
             pUni->HotCounts().Reset(pPc, C_HotCountTable::kArmedValue);
-            const jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc, pBase, pKBase);
+            jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc, pBase, pKBase);
             if (pTrace) {
                 PatchLoopOp(pPc - 1 - insSelf.JumpTarget(), EBcOp::JForL);
                 const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
@@ -1121,6 +1140,9 @@ LJX_H(ForL) {
 LJX_H(JForI) { LJX_MUSTTAIL return OpForI(LJX_PASS_ARGS); }
 LJX_H(IForL) { LJX_MUSTTAIL return OpForL(LJX_PASS_ARGS); }
 LJX_H(JForL) {
+    // While the recorder is live this op behaves as a plain ForL: running the
+    // installed trace here would execute bytecodes the recorder cannot see.
+    if (pUni->m_uRecording) [[unlikely]] LJX_MUSTTAIL return OpForL(LJX_PASS_ARGS);
     TValue_t* pSlots = pBase + uRa;
     const double flStep = pSlots[2].AsDouble();
     const double flIdx = pSlots[0].AsDouble() + flStep;
@@ -1130,7 +1152,7 @@ LJX_H(JForL) {
         pSlots[3] = pSlots[0];
         const BcIns_t insSelf{pPc[-1].uRaw};
         pPc += insSelf.JumpTarget();
-        if (const jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc)) [[likely]] {
+        if (jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc)) [[likely]] {
             const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
             pBase = res.pBase;
             pPc = res.pPc;
@@ -1159,7 +1181,7 @@ LJX_H(IterL) {
         if (pUni->HotCounts().DecrementLoop(pPc) && pUni->TraceJit() &&
             !pUni->m_uRecording) [[unlikely]] {
             pUni->HotCounts().Reset(pPc, C_HotCountTable::kArmedValue);
-            const jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc, pBase, pKBase);
+            jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc, pBase, pKBase);
             if (pTrace) {
                 PatchLoopOp(pPc - 1 - insSelf.JumpTarget(), EBcOp::JIterL);
                 const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
@@ -1173,12 +1195,13 @@ LJX_H(IterL) {
 }
 LJX_H(IIterL) { LJX_MUSTTAIL return OpIterL(LJX_PASS_ARGS); }
 LJX_H(JIterL) {
+    if (pUni->m_uRecording) [[unlikely]] LJX_MUSTTAIL return OpIterL(LJX_PASS_ARGS);
     TValue_t* pSlots = pBase + uRa;
     if (!pSlots[0].IsNil()) {
         pSlots[-1] = pSlots[0];
         const BcIns_t insSelf{pPc[-1].uRaw};
         pPc += insSelf.JumpTarget();
-        if (const jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc)) [[likely]] {
+        if (jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc)) [[likely]] {
             const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
             pBase = res.pBase;
             pPc = res.pPc;
@@ -1193,7 +1216,7 @@ LJX_H(Loop) {
     if (pUni->HotCounts().DecrementLoop(pPc) && pUni->TraceJit() &&
         !pUni->m_uRecording) [[unlikely]] {
         pUni->HotCounts().Reset(pPc, C_HotCountTable::kArmedValue);
-        const jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc - 1, pBase, pKBase);
+        jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc - 1, pBase, pKBase);
         if (pTrace) {
             PatchLoopOp(pPc - 1, EBcOp::JLoop);
             const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
@@ -1206,7 +1229,8 @@ LJX_H(Loop) {
 }
 LJX_H(ILoop) { LJX_NEXT(); }
 LJX_H(JLoop) {
-    if (const jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc - 1)) [[likely]] {
+    if (pUni->m_uRecording) [[unlikely]] LJX_MUSTTAIL return OpLoop(LJX_PASS_ARGS);
+    if (jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc - 1)) [[likely]] {
         const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
         pBase = res.pBase;
         pPc = res.pPc;

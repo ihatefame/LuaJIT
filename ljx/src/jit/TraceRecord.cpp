@@ -80,10 +80,11 @@ C_TraceJit::~C_TraceJit() {
         for (const Trace_t* pTrace : m_vTraces) {
             std::fprintf(stderr, "[trace] #%u entered %llu times\n", pTrace->uNumber,
                          static_cast<unsigned long long>(pTrace->uEntries));
-            for (std::size_t uE = 0; uE < pTrace->vExitCounts.size(); ++uE)
-                if (pTrace->vExitCounts[uE])
-                    std::fprintf(stderr, "[trace]   exit %zu: %llu\n", uE,
-                                 static_cast<unsigned long long>(pTrace->vExitCounts[uE]));
+            for (std::size_t uE = 0; uE < pTrace->vExits.size(); ++uE)
+                if (pTrace->vExits[uE].uCount)
+                    std::fprintf(stderr, "[trace]   exit %zu: %u%s\n", uE,
+                                 pTrace->vExits[uE].uCount,
+                                 pTrace->vExits[uE].pChild ? " -> child" : "");
         }
     for (Trace_t* pTrace : m_vTraces) delete pTrace;
     if (m_pCodeArena) munmap(m_pCodeArena, kCodeArenaSize);
@@ -329,6 +330,7 @@ void C_TraceJit::StartRecording(const BcIns_t* pPc, TValue_t* pBase, const TValu
     m_pBase = pBase;
     m_pKBase = pKBase;
     m_uRecorded = 0;
+    m_pOriginTrace = nullptr;
     m_bPendingCFunc = false;
     m_nBaseOffset = 0;
     m_nTopSlot = 0;
@@ -369,9 +371,15 @@ void C_TraceJit::StartRecording(const BcIns_t* pPc, TValue_t* pBase, const TValu
 void C_TraceJit::AbortRecording(EAbort eReason, const char* sDetail) {
     if (m_eState != ETraceState::Recording) return;
     m_eState = ETraceState::Idle;
-    // Penalize the site so a loop that cannot be recorded is not retried on
-    // every entry; the penalty blacklists it for good.
-    if (m_pStartPc) m_mapHot[m_pStartPc] = kBlacklistCount;
+    // Penalize the site so a region that cannot be recorded is not retried on
+    // every entry; the penalty blacklists it for good. A side recording
+    // penalizes the EXIT that spawned it — its start PC may well be a loop
+    // head that a future root recording can still handle.
+    if (m_pOriginTrace)
+        m_pOriginTrace->vExits[m_uOriginExit].uCount = kBlacklistCount;
+    else if (m_pStartPc)
+        m_mapHot[m_pStartPc] = kBlacklistCount;
+    m_pOriginTrace = nullptr;
     if (TraceDebug())
         std::fprintf(stderr, "[trace] abort (%u): %s\n",
                      static_cast<unsigned>(eReason), sDetail);
@@ -469,25 +477,92 @@ void C_TraceJit::CloseLoop() {
     (void)Emit(EIrOp::Loop, EIrType::Nothing, kIrNone, kIrNone);
     FinalizeSnapshots();
     if (std::getenv("LJX_TRACEIR")) DumpIr();
-    Trace_t* pTrace = Assemble();
+    FinishTrace(Assemble(), nullptr);
+}
+
+void C_TraceJit::CloseLink(Trace_t* pTarget) {
+    // Everything the trace computed goes back to the Lua stack (the End's
+    // snapshot), and the chain enters the target, whose preamble re-loads and
+    // re-guards its entry state from there. No register contract between the
+    // two traces is needed, which is what makes any trace linkable to any
+    // other.
+    const IrRef rEnd = Emit(EIrOp::End, EIrType::Nothing, kIrNone, kIrNone);
+    if (m_eState != ETraceState::Recording) return;   // Emit may have aborted
+    m_vInsSnap[rEnd - kIrBias] =
+        static_cast<std::uint16_t>(TakeSnapshot(pTarget->pStartPc));
+    if (TraceDebug())
+        std::fprintf(stderr, "[trace] closing with link -> #%u (start %p)\n",
+                     pTarget->uNumber, static_cast<const void*>(pTarget->pStartPc));
+    FinalizeSnapshots();
+    if (std::getenv("LJX_TRACEIR")) DumpIr();
+    FinishTrace(Assemble(), pTarget);
+}
+
+void C_TraceJit::FinishTrace(Trace_t* pTrace, Trace_t* pLinkTarget) {
+    Trace_t* pOrigin = m_pOriginTrace;
+    const std::uint32_t uOriginExit = m_uOriginExit;
+    m_pOriginTrace = nullptr;
     m_eState = ETraceState::Idle;
     vm::C_Interpreter::SetRecordMode(*m_pUniverse, false);
     if (!pTrace) {
-        if (m_pStartPc) m_mapHot[m_pStartPc] = kBlacklistCount;
+        if (pOrigin)
+            pOrigin->vExits[uOriginExit].uCount = kBlacklistCount;
+        else if (m_pStartPc)
+            m_mapHot[m_pStartPc] = kBlacklistCount;
         return;
     }
     pTrace->pStartPc = m_pStartPc;
     pTrace->nTopSlot = m_nTopSlot;
+    pTrace->uDepth = pOrigin ? pOrigin->uDepth + 1 : 0;
     pTrace->uNumber = static_cast<std::uint32_t>(m_vTraces.size());
     m_vTraces.push_back(pTrace);
+    // Registered by start PC even for side traces: a later recording that
+    // reaches this PC links here instead of recording the region again.
     m_mapTraces[m_pStartPc] = pTrace;
+    if (pTrace->nLinkExit >= 0 && pLinkTarget)
+        pTrace->vExits[static_cast<std::size_t>(pTrace->nLinkExit)].pChild = pLinkTarget;
+    if (pOrigin) pOrigin->vExits[uOriginExit].pChild = pTrace;
     if (TraceDebug())
-        std::fprintf(stderr, "[trace] #%u compiled: %zu ins, %zu exits\n",
-                     pTrace->uNumber, m_vIns.size(), pTrace->vExits.size());
+        std::fprintf(stderr, "[trace] #%u compiled: %zu ins, %zu exits%s%s\n",
+                     pTrace->uNumber, m_vIns.size(), pTrace->vExits.size(),
+                     pOrigin ? " (side)" : "", pLinkTarget ? " (linked)" : "");
 }
 
-const Trace_t* C_TraceJit::OnLoopEdge(const BcIns_t* pHeadPc, TValue_t* pBase,
-                                      const TValue_t* pKBase) {
+void C_TraceJit::OnHotExit(Trace_t* pParent, std::uint32_t uExit, TValue_t* pBase,
+                           const TValue_t* pKBase) {
+    if (m_eState != ETraceState::Idle) return;
+    TraceExit_t& exit = pParent->vExits[uExit];
+    // A trace already compiled at the resume point links directly — unless it
+    // is the parent itself. That case is an entry-type exit (exit 0 resumes at
+    // the parent's own head): linking it to itself would spin without
+    // progress, so record a NEW trace instead, specialized to the types
+    // present NOW — a type-polymorphic variant chained off the old one.
+    // A chain that keeps sprouting variants is a specialization that does not
+    // hold — a per-iteration closure identity, alternating types. Cap the
+    // depth; beyond it the exit goes back to the interpreter for good.
+    if (pParent->uDepth >= kMaxSideDepth) {
+        exit.uCount = kBlacklistCount;
+        return;
+    }
+    if (const auto it = m_mapTraces.find(exit.pResumePc);
+        it != m_mapTraces.end() && it->second != pParent) {
+        exit.pChild = it->second;
+        if (TraceDebug())
+            std::fprintf(stderr, "[trace] #%u exit %u linked to #%u\n", pParent->uNumber,
+                         uExit, it->second->uNumber);
+        return;
+    }
+    StartRecording(exit.pResumePc, pBase, pKBase);
+    if (m_eState != ETraceState::Recording) return;
+    m_pOriginTrace = pParent;
+    m_uOriginExit = uExit;
+    if (TraceDebug())
+        std::fprintf(stderr, "[trace] side recording from #%u exit %u\n",
+                     pParent->uNumber, uExit);
+}
+
+Trace_t* C_TraceJit::OnLoopEdge(const BcIns_t* pHeadPc, TValue_t* pBase,
+                                const TValue_t* pKBase) {
     // LJX_NOJIT=1 forces everything through the interpreter — the reference
     // semantics the differential test compares compiled output against.
     static const bool bDisabled = std::getenv("LJX_NOJIT") != nullptr;
@@ -520,6 +595,18 @@ void C_TraceJit::RecordInstruction(const BcIns_t* pPc, TValue_t* pBase, const TV
     }
     m_nBaseOffset = static_cast<std::int32_t>(nOffset);
     if (pPc == m_pStartPc && m_uRecorded != 0) { CloseLoop(); return; }
+    // Reaching a PC that already has a compiled trace ends this recording by
+    // LINKING into it. This is what stitches side traces back into their loop,
+    // lets an outer loop's stem enter an inner loop's trace, and — crucially —
+    // stops the recorder before a J-variant op could run the other trace
+    // natively underneath it, which would hide those bytecodes and leave the
+    // slot map stale.
+    if (m_uRecorded != 0) {
+        if (const auto itLink = m_mapTraces.find(pPc); itLink != m_mapTraces.end()) {
+            CloseLink(itLink->second);
+            return;
+        }
+    }
     if (++m_uRecorded > kMaxRecordedIns) {
         AbortRecording(EAbort::TooLong, "recorded instruction budget");
         return;
@@ -600,6 +687,8 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
         case EBcOp::FuncC: case EBcOp::FuncCW:
             return SkipCFuncHeader();
 
+        case EBcOp::ForI: case EBcOp::JForI:
+            return RecordForI(ins, pNext);
         case EBcOp::ForL: case EBcOp::IForL: case EBcOp::JForL:
             return RecordForL(ins, pNext);
 
@@ -799,16 +888,28 @@ bool C_TraceJit::RecordCompare(const BcIns_t& ins, const BcIns_t* pNext) {
     }
     rLeft = SlotRef(nB + ins.A());
     if (rLeft == kIrNone || rRight == kIrNone) return false;
-    // NaN would make the raw compare disagree with Lua equality; a guarded
-    // number that is NaN is vanishingly rare, so reject it outright.
-    if (tvA.IsDouble() && tvA.AsDouble() != tvA.AsDouble()) return false;
-    const bool bEqual = tvA.uRaw == tvB.uRaw;
     const bool bIsEq = eOp == EBcOp::IsEqV || eOp == EBcOp::IsEqS ||
                        eOp == EBcOp::IsEqN || eOp == EBcOp::IsEqP;
+    const EIrType eLeft = TypeOf(rLeft), eRight = TypeOf(rRight);
+    bool bEqual;
+    EIrOp eGuardOp;
+    if (eLeft == EIrType::Num && eRight == EIrType::Num) {
+        // Numbers compare by VALUE — raw bits are wrong for -0.0 == 0.0, and
+        // the operands live in xmm registers, so the guard is a ucomisd.
+        bEqual = tvA.AsDouble() == tvB.AsDouble();
+        eGuardOp = bEqual ? EIrOp::GuardFEq : EIrOp::GuardFNe;
+    } else if (eLeft != eRight) {
+        // Different guarded types can never be equal: the outcome is static
+        // under the operands' own type guards, no comparison needed.
+        return m_eState == ETraceState::Recording;
+    } else {
+        // Same GC/primitive type: identity IS equality, one raw compare.
+        bEqual = tvA.uRaw == tvB.uRaw;
+        eGuardOp = bEqual ? EIrOp::GuardEq : EIrOp::GuardNe;
+    }
     bTaken = bIsEq ? bEqual : !bEqual;
     const BcIns_t* pExitPc = bTaken ? pNext + 1 : pNext + 1 + insJmp.JumpTarget();
-    (void)EmitGuard(bEqual ? EIrOp::GuardEq : EIrOp::GuardNe, Materialize(rLeft),
-                    Materialize(rRight), pExitPc);
+    (void)EmitGuard(eGuardOp, Materialize(rLeft), Materialize(rRight), pExitPc);
     return m_eState == ETraceState::Recording;
 }
 
@@ -825,6 +926,36 @@ bool C_TraceJit::RecordTest(const BcIns_t& ins, const BcIns_t* pNext) {
         SetSlot(nB + ins.A(), rVal);
     (void)insJmp;
     return true;
+}
+
+// ForI is a loop ENTRY, not a back edge: type-check the control triple, guard
+// the direction actually taken (enter or skip), and set the visible variable.
+// Recording one makes traces that CROSS an inner numeric loop possible — the
+// inner head is reached next, and if it has a compiled trace, CloseLink
+// stitches into it.
+bool C_TraceJit::RecordForI(const BcIns_t& ins, const BcIns_t* pNext) {
+    const std::int32_t nB = m_nBaseOffset;
+    const std::int32_t nSlot = nB + static_cast<std::int32_t>(ins.A());
+    const IrRef rIdx = SlotRef(nSlot);
+    const IrRef rStop = SlotRef(nSlot + 1);
+    const IrRef rStep = SlotRef(nSlot + 2);
+    if (TypeOf(rIdx) != EIrType::Num || TypeOf(rStop) != EIrType::Num ||
+        TypeOf(rStep) != EIrType::Num)
+        return false;
+    const double flIdx = m_pBase[ins.A()].AsDouble();
+    const double flStop = m_pBase[ins.A() + 1].AsDouble();
+    const double flStep = m_pBase[ins.A() + 2].AsDouble();
+    // The interpreter copies the visible variable before the entry test.
+    SetSlot(nSlot + 3, rIdx);
+    const bool bEnter = flStep >= 0 ? flIdx <= flStop : flIdx >= flStop;
+    const BcIns_t* pSkip = pNext + ins.JumpTarget();
+    if (bEnter)
+        (void)EmitGuard(flStep >= 0 ? EIrOp::GuardLe : EIrOp::GuardGe,
+                        Materialize(rIdx), Materialize(rStop), pSkip);
+    else
+        (void)EmitGuard(flStep >= 0 ? EIrOp::GuardGt : EIrOp::GuardLt,
+                        Materialize(rIdx), Materialize(rStop), pNext);
+    return m_eState == ETraceState::Recording;
 }
 
 bool C_TraceJit::RecordForL(const BcIns_t& ins, const BcIns_t* pNext) {

@@ -55,6 +55,8 @@ enum class EIrType : std::uint8_t {
     X(AddK)           /* ptr + constant byte offset                         */ \
     X(IdxPtr)         /* ptr + index*8                                      */ \
     X(RefPtr)         /* arena base + granule index*8 (GcRef_t/MRef_t)      */ \
+    X(AndInt)         /* 64-bit bitwise and (hash & mask)                   */ \
+    X(MulK)           /* int * constant (node index -> granule index)       */ \
     /* memory */                                                               \
     X(LoadTV)         /* tagged word at [ptr]; carries the type guard       */ \
     X(StoreTV)                                                                 \

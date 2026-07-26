@@ -55,6 +55,8 @@ constexpr std::int32_t kOfsNodeKey = static_cast<std::int32_t>(offsetof(vm::Tabl
 constexpr std::int32_t kOfsNodeNext = static_cast<std::int32_t>(offsetof(vm::TableNode_t, rNext));
 constexpr std::int32_t kNodeSize = static_cast<std::int32_t>(sizeof(vm::TableNode_t));
 
+constexpr std::int32_t kOfsStrSid = static_cast<std::int32_t>(offsetof(C_GcString, m_uSid));
+
 constexpr std::uint32_t kMaxChainWalk = 4;
 
 }  // namespace
@@ -489,7 +491,7 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
             bool bAbsent = false;
             const IrRef rNode = HashNodeRef(ConstantPtr(pGlobals), pGlobals,
                                             TValue_t::GcObject(EValueTag::String, pStr),
-                                            pNext - 1, bAbsent);
+                                            kIrNone, pNext - 1, bAbsent);
             if (m_eState != ETraceState::Recording) return false;
             if (bAbsent) { SetSlot(nB + uA, Constant(TValue_t::Nil())); return true; }
             if (rNode == kIrNone) return false;
@@ -641,45 +643,57 @@ bool C_TraceJit::RecordForL(const BcIns_t& ins, const BcIns_t* pNext) {
 // ---------------------------------------------------------------------------
 
 IrRef C_TraceJit::HashNodeRef(IrRef rTabPtr, const C_GcTable* pTab, TValue_t tvKey,
-                              const BcIns_t* pResumePc, bool& bAbsent) {
+                              IrRef rKeyRef, const BcIns_t* pResumePc, bool& bAbsent) {
     bAbsent = false;
+    if (!tvKey.Is(EValueTag::String)) return kIrNone;   // only string keys, for now
     const std::uintptr_t uArena = m_pUniverse->ArenaBase();
-    // The main position depends only on the key and the mask, so guarding the
-    // mask turns the first node index into a compile-time constant while
-    // keeping the trace polymorphic across every table of this shape.
+    const auto* pStr = static_cast<const C_GcString*>(tvKey.AsGcPointer());
+
+    // The main position is computed the way the runtime computes it — mask
+    // loaded, string id loaded when the key is not a constant — so the trace
+    // works for ANY key and survives a rehash instead of guarding the mask.
     const IrRef rHmask = Emit(EIrOp::LoadU32, EIrType::Int,
                               Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr, ConstantInt(kOfsTabHmask)),
                               kIrNone);
-    (void)EmitGuard(EIrOp::GuardEqI, rHmask, ConstantInt(pTab->m_uHashMask), pResumePc);
-    const IrRef rNodesIdx = Emit(EIrOp::LoadU32, EIrType::Int,
-                                 Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
-                                      ConstantInt(kOfsTabNodes)),
-                                 kIrNone);
-    IrRef rNode = Emit(EIrOp::RefPtr, EIrType::Ptr, rNodesIdx, kIrNone);
+    IrRef rSid;
+    IrRef rKeyTagged;
+    if (rKeyRef == kIrNone || IsConstRef(rKeyRef)) {
+        rSid = ConstantInt(pStr->m_uSid);
+        rKeyTagged = Constant(tvKey);
+    } else {
+        if (TypeOf(rKeyRef) != EIrType::Str) return kIrNone;
+        rSid = Emit(EIrOp::LoadU32, EIrType::Int,
+                    Emit(EIrOp::AddK, EIrType::Ptr,
+                         Emit(EIrOp::TabPtr, EIrType::Ptr, rKeyRef, kIrNone),
+                         ConstantInt(kOfsStrSid)),
+                    kIrNone);
+        rKeyTagged = rKeyRef;
+    }
+    const IrRef rMain = Emit(EIrOp::AndInt, EIrType::Int, rSid, rHmask);
+    // A node is three granules wide, so the byte offset is an IdxPtr scale.
+    const IrRef rGranule = Emit(EIrOp::MulK, EIrType::Int, rMain,
+                                ConstantInt(kNodeSize / 8));
+    const IrRef rNodes = Emit(EIrOp::RefPtr, EIrType::Ptr,
+                              Emit(EIrOp::LoadU32, EIrType::Int,
+                                   Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
+                                        ConstantInt(kOfsTabNodes)),
+                                   kIrNone),
+                              kIrNone);
+    IrRef rNode = Emit(EIrOp::IdxPtr, EIrType::Ptr, rNodes, rGranule);
     if (rNode == kIrNone) return kIrNone;
 
-    std::uint32_t uHash;
-    if (tvKey.Is(EValueTag::String)) {
-        uHash = static_cast<const C_GcString*>(tvKey.AsGcPointer())->m_uSid;
-    } else {
-        return kIrNone;   // only string keys reach the hash part on a trace
-    }
-    rNode = Emit(EIrOp::AddK, EIrType::Ptr, rNode,
-                 ConstantInt(static_cast<std::int64_t>(uHash & pTab->m_uHashMask) * kNodeSize));
-
     const auto* pNode = static_cast<const vm::TableNode_t*>(core::RefToPtr(uArena, pTab->m_rNodes)) +
-                        (uHash & pTab->m_uHashMask);
-    const IrRef rKeyConst = Constant(tvKey);
+                        (pStr->m_uSid & pTab->m_uHashMask);
     for (std::uint32_t uStep = 0; uStep < kMaxChainWalk; ++uStep) {
         const IrRef rNodeKey = Emit(EIrOp::LoadTV, EIrType::Int,
                                     Emit(EIrOp::AddK, EIrType::Ptr, rNode,
                                          ConstantInt(kOfsNodeKey)),
                                     kIrNone);
         if (pNode->tvKey == tvKey) {
-            (void)EmitGuard(EIrOp::GuardEq, rNodeKey, rKeyConst, pResumePc);
-            return rNode;
+            (void)EmitGuard(EIrOp::GuardEq, rNodeKey, rKeyTagged, pResumePc);
+            return m_eState == ETraceState::Recording ? rNode : kIrNone;
         }
-        (void)EmitGuard(EIrOp::GuardNe, rNodeKey, rKeyConst, pResumePc);
+        (void)EmitGuard(EIrOp::GuardNe, rNodeKey, rKeyTagged, pResumePc);
         if (m_eState != ETraceState::Recording) return kIrNone;
         const IrRef rNextIdx = Emit(EIrOp::LoadU32, EIrType::Int,
                                     Emit(EIrOp::AddK, EIrType::Ptr, rNode,
@@ -687,7 +701,7 @@ IrRef C_TraceJit::HashNodeRef(IrRef rTabPtr, const C_GcTable* pTab, TValue_t tvK
                                     kIrNone);
         if (pNode->rNext.IsNull()) {
             (void)EmitGuard(EIrOp::GuardEqI, rNextIdx, ConstantInt(0), pResumePc);
-            bAbsent = true;
+            bAbsent = m_eState == ETraceState::Recording;
             return kIrNone;
         }
         rNode = Emit(EIrOp::RefPtr, EIrType::Ptr, rNextIdx, kIrNone);
@@ -745,15 +759,10 @@ bool C_TraceJit::RecordTableGet(const BcIns_t& ins, const BcIns_t* pNext, TValue
     }
 
     if (!tvKey.Is(EValueTag::String)) return false;
-    if (rKeyDynamic != kIrNone) {
-        // A variable string key would need a full hash walk: only a constant
-        // key folds to a bounded, guardable chain.
-        if (!IsConstRef(rKeyDynamic)) return false;
-    }
 
     // --- hash part of the receiver -----------------------------------------
     bool bAbsent = false;
-    const IrRef rNode = HashNodeRef(rTabPtr, pTab, tvKey, pResumePc, bAbsent);
+    const IrRef rNode = HashNodeRef(rTabPtr, pTab, tvKey, rKeyDynamic, pResumePc, bAbsent);
     if (m_eState != ETraceState::Recording) return false;
     if (!bAbsent && rNode == kIrNone) return false;
     if (!bAbsent) {
@@ -853,8 +862,13 @@ bool C_TraceJit::RecordTableSet(const BcIns_t& ins, const BcIns_t* pNext, TValue
     }
 
     if (!tvKey.Is(EValueTag::String)) return false;
+    IrRef rKeyRef = kIrNone;
+    if (ins.Op() == EBcOp::TSetV) {
+        rKeyRef = SlotRef(nB + static_cast<std::int32_t>(ins.D() & 0xff));
+        if (rKeyRef == kIrNone) return false;
+    }
     bool bAbsent = false;
-    const IrRef rNode = HashNodeRef(rTabPtr, pTab, tvKey, pResumePc, bAbsent);
+    const IrRef rNode = HashNodeRef(rTabPtr, pTab, tvKey, rKeyRef, pResumePc, bAbsent);
     if (m_eState != ETraceState::Recording) return false;
     // Creating a key would resize and allocate — not something a trace does.
     if (bAbsent || rNode == kIrNone) return false;

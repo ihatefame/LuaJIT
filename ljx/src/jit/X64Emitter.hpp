@@ -345,6 +345,19 @@ public:
         U8(static_cast<std::uint8_t>(0xC0 | ((uDst & 7) << 3) | (uSrc & 7)));
         U8(uMode);
     }
+    // and r64Dst, r64Src     REX.W 21 /r   (rm = dst, reg = src)
+    void AndR64(std::uint8_t uDst, std::uint8_t uSrc) {
+        RexRegRm(uSrc, uDst, true);
+        U8(0x21);
+        U8(static_cast<std::uint8_t>(0xC0 | ((uSrc & 7) << 3) | (uDst & 7)));
+    }
+    // imul r64Dst, r64Src, imm32   REX.W 69 /r id
+    void ImulR64Imm(std::uint8_t uDst, std::uint8_t uSrc, std::uint32_t u) {
+        RexRegRm(uDst, uSrc, true);
+        U8(0x69);
+        U8(static_cast<std::uint8_t>(0xC0 | ((uDst & 7) << 3) | (uSrc & 7)));
+        U32(u);
+    }
     // sub/add rsp, imm32
     void SubRspImm32(std::uint32_t u) { U8(0x48); U8(0x81); U8(0xEC); U32(u); }
     void AddRspImm32(std::uint32_t u) { U8(0x48); U8(0x81); U8(0xC4); U32(u); }

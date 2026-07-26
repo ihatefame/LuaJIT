@@ -34,7 +34,7 @@ check regress "$(printf '6765\n5050\n1024\n-2\n15\ntrue\nnested-ok\n42\n3\n120')
 # mid-loop, two-level inheritance, a mid-iteration type change, array and field
 # stores, inlined calls, descending loops and a break out of a traced loop.
 # Every line here is byte-identical to LuaJIT's own output.
-check trace "$(printf 'dot\t2200\noverride\tclass\tclass\tinstance\tinstance\ninherit\tbase\ndeopt\t450\narray\t98400\nfields\t301\t601\nmisc\t2406\nbreak\t201')"
+check trace "$(printf 'dot\t2200\noverride\tclass\tclass\tinstance\tinstance\ninherit\tbase\ndeopt\t450\narray\t98400\nfields\t301\t601\nmisc\t2406\nbreak\t201\ndict\t80\t80\npressure\t5902608.5\t116509\t3058\npoly\t6000')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
 # script in tests/lua is run both ways and the outputs compared.

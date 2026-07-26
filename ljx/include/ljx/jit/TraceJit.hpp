@@ -129,8 +129,8 @@ private:
     // a key that is PRESENT, or kIrNone (with bAbsent set) when the recorded
     // lookup proved the key absent.
     [[nodiscard]] IrRef HashNodeRef(IrRef rTabPtr, const vm::C_GcTable* pTab,
-                                    vm::TValue_t tvKey, const vm::BcIns_t* pResumePc,
-                                    bool& bAbsent);
+                                    vm::TValue_t tvKey, IrRef rKeyRef,
+                                    const vm::BcIns_t* pResumePc, bool& bAbsent);
 
     // --- backend ------------------------------------------------------------
     [[nodiscard]] Trace_t* Assemble();

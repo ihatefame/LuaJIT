@@ -107,6 +107,7 @@ private:
         return static_cast<std::int32_t>(uIdx * 8);
     }
 
+    void ComputeInvariance();
     void ComputeLiveness();
     [[nodiscard]] bool Allocate(std::size_t uIdx, bool bFloat, std::uint8_t& uOut);
     [[nodiscard]] std::uint8_t OperandGpr(IrRef r, int nScratch);
@@ -135,6 +136,7 @@ private:
     std::vector<std::uint8_t> m_vReg;       // per IR index
     std::vector<std::uint8_t> m_vSpilled;
     std::vector<std::uint8_t> m_vNoSpill;
+    std::vector<std::uint8_t> m_vInvariant;
     std::uint32_t m_vGprOwner[16]{};        // IR index + 1, 0 = free
     std::uint32_t m_vXmmOwner[16]{};
     std::uint32_t m_uGprPinned = 0;
@@ -143,15 +145,83 @@ private:
     std::size_t m_uCurIdx = 0;
     bool m_bFailed = false;
     std::size_t m_uLoopTop = 0;
+    std::size_t m_uHoisted = 0;
 };
+
+// Loop-invariant code motion.
+//
+// Everything a field access costs except the value load itself is invariant
+// when the receiver is: the mask and node-array loads, the main-position
+// arithmetic, the node addresses, and the node KEY loads with their guards
+// (a raw store rewrites a node's value word, never its key). Hoisting them
+// leaves a loop body that is essentially load, guard the type, compute, store
+// — which is the shape LuaJIT's hoisted pre-roll produces.
+//
+// Guards that move into the pre-roll are re-pointed at snapshot 0, the entry
+// exit: nothing has been modified when they run, so resuming at the trace head
+// with the interpreter's own state is always correct.
+void C_TraceAsm::ComputeInvariance() {
+    const std::size_t uCount = m_vIns.size();
+    m_vInvariant.assign(uCount, 0);
+    // A stack slot is loop-invariant exactly when the recorded iteration left
+    // it holding the value it was entered with.
+    std::vector<std::uint8_t> vSlotFixed(m_vSlotValue.size(), 0);
+    for (std::size_t uS = 0; uS < m_vSlotValue.size(); ++uS)
+        vSlotFixed[uS] = m_vSlotEntry[uS] != kIrNone && m_vSlotValue[uS] == m_vSlotEntry[uS];
+
+    auto Inv = [&](IrRef r) {
+        return r == kIrNone || IsConstRef(r) || m_vInvariant[r - kIrBias] != 0;
+    };
+    // Header words a trace can never write: array/metatable/next, node array,
+    // array size, hash mask. The version word (and anything else) is excluded.
+    auto IsStableField = [&](IrRef rAddr) {
+        if (rAddr == kIrNone || IsConstRef(rAddr)) return false;
+        const IrIns_t& addr = m_vIns[rAddr - kIrBias];
+        if (addr.eOp != EIrOp::AddK) return false;
+        const std::uint64_t uOfs = ConstOf(addr.rOp2);
+        return uOfs == 8 || uOfs == 16 || uOfs == 20 || uOfs == 24 || uOfs == 28;
+    };
+
+    for (std::size_t uI = 0; uI < uCount; ++uI) {
+        const IrIns_t& ins = m_vIns[uI];
+        bool bInv = false;
+        switch (ins.eOp) {
+            case EIrOp::SLoad:
+                bInv = ins.rOp1 < vSlotFixed.size() && vSlotFixed[ins.rOp1] != 0;
+                break;
+            case EIrOp::Nop: case EIrOp::SStore: case EIrOp::StoreTV:
+            case EIrOp::IncU32: case EIrOp::Loop:
+                break;
+            case EIrOp::LoadU32:
+                bInv = IsStableField(ins.rOp1) && Inv(ins.rOp1);
+                break;
+            case EIrOp::LoadTV:
+                // Only the untyped form — that is the node key word, which a
+                // raw store never touches. Value loads stay in the loop.
+                bInv = ins.eType == EIrType::Int && Inv(ins.rOp1);
+                break;
+            default:
+                bInv = Inv(ins.rOp1) && Inv(ins.rOp2);
+                break;
+        }
+        m_vInvariant[uI] = bInv ? 1 : 0;
+    }
+}
 
 void C_TraceAsm::ComputeLiveness() {
     const std::size_t uCount = m_vIns.size();
+    ComputeInvariance();
     m_vOrder.reserve(uCount);
     for (std::size_t uI = 0; uI < uCount; ++uI)
         if (m_vIns[uI].eOp == EIrOp::SLoad) m_vOrder.push_back(uI);
     for (std::size_t uI = 0; uI < uCount; ++uI)
-        if (m_vIns[uI].eOp != EIrOp::SLoad && m_vIns[uI].eOp != EIrOp::Nop)
+        if (m_vIns[uI].eOp != EIrOp::SLoad && m_vIns[uI].eOp != EIrOp::Nop &&
+            m_vInvariant[uI])
+            m_vOrder.push_back(uI);
+    m_uHoisted = m_vOrder.size();
+    for (std::size_t uI = 0; uI < uCount; ++uI)
+        if (m_vIns[uI].eOp != EIrOp::SLoad && m_vIns[uI].eOp != EIrOp::Nop &&
+            !m_vInvariant[uI])
             m_vOrder.push_back(uI);
 
     m_vLastUse.assign(uCount, 0);
@@ -189,11 +259,19 @@ void C_TraceAsm::ComputeLiveness() {
                 Use(m_vSnapSlots[snap.uFirstSlot + uS].rValue, uP);
         }
     }
-    // Entry loads and every loop-carried value stay live across the back edge.
+    // Entry loads, every loop-carried value, and everything hoisted into the
+    // pre-roll stay live across the back edge: their definitions execute once,
+    // so a register freed inside the loop would be read as garbage on the next
+    // iteration. Hoisted values may still SPILL — the home slot is written once
+    // and reloading from it inside the loop is always correct — but the entry
+    // loads may not, because the back-edge copies write to their registers.
     for (std::size_t uI = 0; uI < uCount; ++uI) {
-        if (m_vIns[uI].eOp != EIrOp::SLoad) continue;
-        m_vLastUse[uI] = uEnd;
-        m_vNoSpill[uI] = 1;
+        if (m_vIns[uI].eOp == EIrOp::SLoad) {
+            m_vLastUse[uI] = uEnd;
+            m_vNoSpill[uI] = 1;
+        } else if (m_vInvariant[uI]) {
+            m_vLastUse[uI] = uEnd;
+        }
     }
     for (std::size_t uS = 0; uS < m_vSlotValue.size(); ++uS) {
         const IrRef rVal = m_vSlotValue[uS];
@@ -295,6 +373,9 @@ std::uint8_t C_TraceAsm::OperandXmm(IrRef r, int nScratch) {
 // point; the stub emitted later writes it back to the Lua stack.
 std::uint32_t C_TraceAsm::BeginExit(std::uint16_t uSnap) {
     PendingExit_t exit;
+    // A hoisted guard runs before the loop body has changed anything, so its
+    // exit is the entry exit: resume at the trace head, restore nothing.
+    if (m_uPos < m_uHoisted) uSnap = 0;
     const Snapshot_t& snap = m_vSnap[uSnap];
     exit.pResumePc = static_cast<const vm::BcIns_t*>(snap.pResumePc);
     exit.nBaseOffset = snap.nBaseOffset;
@@ -518,6 +599,22 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             return true;
         }
 
+        case EIrOp::AndInt: {
+            const std::uint8_t uA = OperandGpr(ins.rOp1, 0);
+            const std::uint8_t uB = OperandGpr(ins.rOp2, 1);
+            if (!Allocate(uIdx, false, uDst)) return false;
+            m_Emit.MovR64R64(uDst, uA);
+            m_Emit.AndR64(uDst, uB);
+            return true;
+        }
+
+        case EIrOp::MulK: {
+            const std::uint8_t uA = OperandGpr(ins.rOp1, 0);
+            if (!Allocate(uIdx, false, uDst)) return false;
+            m_Emit.ImulR64Imm(uDst, uA, static_cast<std::uint32_t>(ConstOf(ins.rOp2)));
+            return true;
+        }
+
         case EIrOp::RefPtr: {
             const std::uint8_t uA = OperandGpr(ins.rOp1, 0);
             if (!Allocate(uIdx, false, uDst)) return false;
@@ -623,11 +720,11 @@ bool C_TraceAsm::Run() {
     m_Emit.MovR64R64(kRegArena, kRsi);
 
     // --- preamble + body ----------------------------------------------------
-    bool bSeenNonSLoad = false;
+    bool bAtLoopTop = false;
     for (std::uint32_t uP = 0; uP < m_vOrder.size(); ++uP) {
         const std::size_t uI = m_vOrder[uP];
-        if (!bSeenNonSLoad && m_vIns[uI].eOp != EIrOp::SLoad) {
-            bSeenNonSLoad = true;
+        if (!bAtLoopTop && uP >= m_uHoisted) {
+            bAtLoopTop = true;
             m_uLoopTop = m_Emit.Here();
         }
         m_uPos = uP;
@@ -635,7 +732,7 @@ bool C_TraceAsm::Run() {
         FreeDead(uP);
         if (!EmitOne(uI) || m_bFailed) return false;
     }
-    if (!bSeenNonSLoad) m_uLoopTop = m_Emit.Here();
+    if (!bAtLoopTop) m_uLoopTop = m_Emit.Here();
     const std::size_t uBackEdge = m_Emit.Jmp();
     m_Emit.PatchTo(uBackEdge, m_uLoopTop);
 

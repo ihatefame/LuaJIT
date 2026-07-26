@@ -68,3 +68,37 @@ for i = 1, 500 do
   if i * i > 40000 then found = i break end
 end
 print("break", found)
+
+-- 7. dictionary traffic with a VARIABLE string key: the main position has to
+--    be computed at run time from the key's id, not folded to a constant.
+local counts = {}
+local keys = {"alpha", "beta", "gamma", "delta", "epsilon"}
+for i = 1, 400 do
+  local k = keys[(i % 5) + 1]
+  counts[k] = (counts[k] or 0) + 1
+end
+print("dict", counts.alpha, counts.epsilon)
+
+-- 8. more simultaneously live values than there are registers, so the
+--    allocator has to spill and reload inside the loop.
+local a1, a2, a3, a4, a5, a6 = 1, 2, 3, 4, 5, 6
+local b1, b2, b3, b4, b5, b6 = 7, 8, 9, 10, 11, 12
+local c1, c2, c3, c4 = 13, 14, 15, 16
+for i = 1, 300 do
+  a1 = a1 + b1 * 0.5; a2 = a2 + b2 * 0.5; a3 = a3 + b3 * 0.5
+  a4 = a4 + b4 * 0.5; a5 = a5 + b5 * 0.5; a6 = a6 + b6 * 0.5
+  b1 = b1 + c1 * 0.25; b2 = b2 + c2 * 0.25
+  b3 = b3 + c3 * 0.25; b4 = b4 + c4 * 0.25
+  c1 = c1 + 1; c2 = c2 + 2; c3 = c3 + 3; c4 = c4 + 4
+end
+print("pressure", a1 + a2 + a3 + a4 + a5 + a6, b1 + b2 + b3 + b4, c1 + c2 + c3 + c4)
+
+-- 9. nested field chains and a receiver that CHANGES every iteration, which
+--    the hoisting pass must not treat as loop invariant.
+local objs = {Vec.new(1, 1), Vec.new(2, 2), Vec.new(3, 3), Vec.new(4, 4)}
+local tot = 0
+for i = 1, 400 do
+  local o = objs[(i % 4) + 1]
+  tot = tot + o:dot(o)
+end
+print("poly", tot)

@@ -58,6 +58,7 @@ constexpr std::int32_t kOfsNodeNext = static_cast<std::int32_t>(offsetof(vm::Tab
 constexpr std::int32_t kNodeSize = static_cast<std::int32_t>(sizeof(vm::TableNode_t));
 
 constexpr std::int32_t kOfsStrSid = static_cast<std::int32_t>(offsetof(C_GcString, m_uSid));
+constexpr std::int32_t kOfsStrLen = static_cast<std::int32_t>(offsetof(C_GcString, m_uLength));
 
 constexpr std::uint32_t kMaxChainWalk = 4;
 
@@ -144,7 +145,8 @@ IrRef C_TraceJit::Emit(EIrOp eOp, EIrType eType, IrRef rOp1, IrRef rOp2) {
     m_vChain[static_cast<std::size_t>(eOp)] = rNew;
     // A store invalidates the load chains: a later load must not be forwarded
     // across it. Truncating the chain is the whole alias analysis.
-    if (eOp == EIrOp::StoreTV || eOp == EIrOp::SStore) {
+    if (eOp == EIrOp::StoreTV || eOp == EIrOp::SStore || eOp == EIrOp::CallSetNew ||
+        eOp == EIrOp::CallSetNewK) {
         m_vChain[static_cast<std::size_t>(EIrOp::LoadTV)] = kIrNone;
         m_vChain[static_cast<std::size_t>(EIrOp::LoadU32)] = kIrNone;
     }
@@ -801,6 +803,16 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
             return true;
         }
 
+        case EBcOp::TNew: {
+            const IrRef rRes = EmitSnapped(EIrOp::CallNewTab, EIrType::Tab,
+                                           ConstantInt(ins.D()), kIrNone, pNext - 1);
+            if (rRes == kIrNone) return false;
+            SetSlot(nB + uA, rRes);
+            return true;
+        }
+        case EBcOp::Cat: return RecordCat(ins, pNext);
+        case EBcOp::Len: return RecordLen(ins, pNext);
+
         case EBcOp::Call: return RecordCall(ins, pNext);
         case EBcOp::Ret0: return RecordReturn(ins, 0, 0);
         case EBcOp::Ret1: return RecordReturn(ins, uA, 1);
@@ -925,6 +937,60 @@ bool C_TraceJit::RecordTest(const BcIns_t& ins, const BcIns_t* pNext) {
         SetSlot(nB + ins.A(), rVal);
     (void)insJmp;
     return true;
+}
+
+bool C_TraceJit::GuardNoMetatable(IrRef rTabPtr, const BcIns_t* pResumePc) {
+    (void)EmitGuard(EIrOp::GuardEqI,
+                    Emit(EIrOp::LoadU32, EIrType::Int,
+                         Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr, ConstantInt(kOfsTabMeta)),
+                         kIrNone),
+                    ConstantInt(0), pResumePc);
+    return m_eState == ETraceState::Recording;
+}
+
+// Concatenation allocates, so it is a helper call; the operand types are
+// guarded here (string | number only), which is what makes the helper unable
+// to raise or call back into the interpreter.
+bool C_TraceJit::RecordCat(const BcIns_t& ins, const BcIns_t* pNext) {
+    const std::int32_t nB = m_nBaseOffset;
+    const std::uint32_t uFirst = ins.B();
+    const std::uint32_t uLast = ins.C();
+    if (uLast < uFirst || uLast - uFirst + 1 > 24) return false;
+    for (std::uint32_t uS = uFirst; uS <= uLast; ++uS) {
+        const IrRef rOperand = SlotRef(nB + static_cast<std::int32_t>(uS));
+        const EIrType eType = TypeOf(rOperand);
+        if (eType != EIrType::Str && eType != EIrType::Num) return false;
+    }
+    const std::uint32_t uDesc = static_cast<std::uint32_t>(nB + uFirst) |
+                                ((uLast - uFirst + 1) << 8);
+    const IrRef rRes = EmitSnapped(EIrOp::CallCat, EIrType::Str, ConstantInt(uDesc),
+                                   kIrNone, pNext - 1);
+    if (rRes == kIrNone) return false;
+    SetSlot(nB + ins.A(), rRes);
+    return true;
+}
+
+bool C_TraceJit::RecordLen(const BcIns_t& ins, const BcIns_t* pNext) {
+    const std::int32_t nB = m_nBaseOffset;
+    const IrRef rV = SlotRef(nB + ins.D());
+    if (TypeOf(rV) == EIrType::Str) {
+        // Immutable: one field load, no call.
+        const IrRef rLen = Emit(EIrOp::LoadU32, EIrType::Int,
+                                Emit(EIrOp::AddK, EIrType::Ptr,
+                                     Emit(EIrOp::TabPtr, EIrType::Ptr, rV, kIrNone),
+                                     ConstantInt(kOfsStrLen)),
+                                kIrNone);
+        SetSlot(nB + ins.A(), Emit(EIrOp::ToNum, EIrType::Num, rLen, kIrNone));
+        return m_eState == ETraceState::Recording;
+    }
+    if (TypeOf(rV) != EIrType::Tab) return false;
+    // The nil-border search is a real loop: a helper call (no allocation).
+    const IrRef rLen = EmitSnapped(EIrOp::CallLen, EIrType::Int,
+                                   ConstantInt(static_cast<std::uint32_t>(nB + ins.D())),
+                                   kIrNone, pNext - 1);
+    if (rLen == kIrNone) return false;
+    SetSlot(nB + ins.A(), Emit(EIrOp::ToNum, EIrType::Num, rLen, kIrNone));
+    return m_eState == ETraceState::Recording;
 }
 
 // ForI is a loop ENTRY, not a back edge: type-check the control triple, guard
@@ -1202,9 +1268,21 @@ bool C_TraceJit::RecordTableSet(const BcIns_t& ins, const BcIns_t* pNext, TValue
         const double flKey = tvKey.AsDouble();
         const auto nKey = static_cast<std::int64_t>(flKey);
         if (static_cast<double>(nKey) != flKey) return false;
-        if (static_cast<std::uint64_t>(nKey) >= pTab->m_uArraySize) return false;
-        IrRef rIdx;
         const std::uint32_t uKeySlot = ins.D() & 0xff;
+        if (static_cast<std::uint64_t>(nKey) >= pTab->m_uArraySize) {
+            // Out of the array part at record time: an append or a fresh
+            // key. Creating it can resize, so it is a helper call — legal
+            // only when no __newindex can fire.
+            if (ins.Op() != EBcOp::TSetV) return false;
+            if (!GuardNoMetatable(rTabPtr, pResumePc)) return false;
+            const std::uint32_t uDesc =
+                static_cast<std::uint32_t>(nTabSlot) |
+                (static_cast<std::uint32_t>(nB + static_cast<std::int32_t>(uKeySlot)) << 8) |
+                (static_cast<std::uint32_t>(nB + static_cast<std::int32_t>(ins.A())) << 16);
+            return EmitSnapped(EIrOp::CallSetNew, EIrType::Nothing, ConstantInt(uDesc),
+                               kIrNone, pResumePc) != kIrNone;
+        }
+        IrRef rIdx;
         if (ins.Op() == EBcOp::TSetV) {
             const IrRef rKey = SlotRef(nB + static_cast<std::int32_t>(uKeySlot));
             if (TypeOf(rKey) != EIrType::Num) return false;
@@ -1240,8 +1318,26 @@ bool C_TraceJit::RecordTableSet(const BcIns_t& ins, const BcIns_t* pNext, TValue
     bool bAbsent = false;
     const IrRef rNode = HashNodeRef(rTabPtr, pTab, tvKey, rKeyRef, pResumePc, bAbsent);
     if (m_eState != ETraceState::Recording) return false;
-    // Creating a key would resize and allocate — not something a trace does.
-    if (bAbsent || rNode == kIrNone) return false;
+    if (bAbsent) {
+        // The walk PROVED the key absent: create it through the runtime,
+        // which may resize. Only without a metatable — no __newindex.
+        if (!GuardNoMetatable(rTabPtr, pResumePc)) return false;
+        const std::uint32_t uValSlot =
+            static_cast<std::uint32_t>(nB + static_cast<std::int32_t>(ins.A()));
+        if (ins.Op() == EBcOp::TSetV) {
+            const std::uint32_t uDesc =
+                static_cast<std::uint32_t>(nTabSlot) |
+                (static_cast<std::uint32_t>(nB + static_cast<std::int32_t>(ins.D() & 0xff))
+                 << 8) |
+                (uValSlot << 16);
+            return EmitSnapped(EIrOp::CallSetNew, EIrType::Nothing, ConstantInt(uDesc),
+                               kIrNone, pResumePc) != kIrNone;
+        }
+        const std::uint32_t uDesc = static_cast<std::uint32_t>(nTabSlot) | (uValSlot << 16);
+        return EmitSnapped(EIrOp::CallSetNewK, EIrType::Nothing, ConstantInt(uDesc),
+                           Constant(tvKey), pResumePc) != kIrNone;
+    }
+    if (rNode == kIrNone) return false;
     const TValue_t* pSlot = pTab->Get(*m_pUniverse, tvKey);
     if (!pSlot || pSlot->IsNil()) return false;
     // No version bump: the structural version does not see value stores, and

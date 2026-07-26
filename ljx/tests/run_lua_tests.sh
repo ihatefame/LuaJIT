@@ -48,6 +48,9 @@ check trace_side "$(printf '2667333\t2667\n2000\n184650\n106\t106\n20100\t8000\n
 # __index/metatables, shadowing keys and dictionary stores must all be seen
 # through slot addresses.
 check trace_invalidate "$(printf '202099\n36004\n28004\n6001\n12000\n102049\n4000\t8000')"
+# Allocation in traces: appends, fresh tables, string building, GC pressure
+# inside compiled loops, computed string keys.
+check trace_alloc "$(printf '3000\t2\t6000\n1\t4000\t400\n17700\n98775\n1\t500\n2000\t4')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
 # script in tests/lua is run both ways and the outputs compared.

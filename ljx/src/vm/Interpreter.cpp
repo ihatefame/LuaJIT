@@ -580,6 +580,9 @@ LJX_FORCEINLINE std::uint32_t FormatNumber(char* pOut, double flValue) noexcept 
 }
 
 // Out of line: musttail cannot cross a scope with non-trivial destructors.
+}  // namespace
+
+// Outside the anonymous namespace: the trace runtime helpers call this.
 LJX_NOINLINE C_GcString* CatSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_t* pPc,
                                  std::uint32_t uFirst, std::uint32_t uLast) {
     // Stack buffer covers virtually all concatenations; spill to the heap
@@ -620,6 +623,8 @@ LJX_NOINLINE C_GcString* CatSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_
     std::free(pHeap);
     return pResult;
 }
+
+namespace {
 
 LJX_H(Cat) {
     if (pUni->Gc().NeedsStep()) [[unlikely]] GcCheck(pUni, pBase);
@@ -1276,6 +1281,84 @@ LJX_PRESERVE_NONE void RecordAndExecute(LJX_HANDLER_ARGS) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Trace runtime helpers. Called from compiled code AFTER a full snapshot
+// write-back: the Lua stack is current, so it is both the argument channel
+// and the GC root set. The collector never moves objects, so pointers the
+// trace still holds in registers survive a collection here. Errors raised
+// inside longjmp straight past the trace's native frame to the protected
+// boundary — the written-back stack is exactly the state the interpreter
+// would have had.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+LJX_NOINLINE void TraceGcPoint(C_Universe* pUni, TValue_t* pBase, std::uint32_t uTop) {
+    C_LuaThread* pThread = pUni->MainThread();
+    pThread->m_pBase = pBase;
+    pThread->m_pTop = pBase + uTop;
+    if (pBase + uTop > pThread->m_pHighWater) pThread->m_pHighWater = pBase + uTop;
+    if (pUni->Gc().NeedsStep()) pUni->Gc().CollectNow();
+}
+
+}  // namespace
+
+}  // namespace ljx::vm
+
+namespace ljx::jit {
+
+using vm::C_GcTable;
+using vm::EValueTag;
+using vm::TValue_t;
+
+std::uint64_t TraceHelpNewTab(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
+                              std::uint32_t uTop) {
+    vm::TraceGcPoint(pUni, pBase, uTop);
+    C_GcTable* pTab = C_GcTable::New(*pUni, uDesc & 0x7ff, uDesc >> 11);
+    return TValue_t::GcObject(EValueTag::Table, pTab).uRaw;
+}
+
+std::uint64_t TraceHelpSetNew(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
+                              std::uint32_t uTop) {
+    vm::TraceGcPoint(pUni, pBase, uTop);
+    auto* pTab = static_cast<C_GcTable*>(pBase[uDesc & 0xff].AsGcPointer());
+    *pTab->Set(*pUni, pBase[(uDesc >> 8) & 0xff]) = pBase[(uDesc >> 16) & 0xff];
+    pUni->Gc().BarrierBackTable(pTab);
+    return 0;
+}
+
+std::uint64_t TraceHelpSetNewK(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
+                               std::uint32_t uTop, std::uint64_t uKeyRaw) {
+    vm::TraceGcPoint(pUni, pBase, uTop);
+    auto* pTab = static_cast<C_GcTable*>(pBase[uDesc & 0xff].AsGcPointer());
+    *pTab->Set(*pUni, TValue_t{uKeyRaw}) = pBase[(uDesc >> 16) & 0xff];
+    pUni->Gc().BarrierBackTable(pTab);
+    return 0;
+}
+
+std::uint64_t TraceHelpCat(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
+                           std::uint32_t uTop) {
+    vm::TraceGcPoint(pUni, pBase, uTop);
+    const std::uint32_t uFirst = uDesc & 0xff;
+    const std::uint32_t uCount = (uDesc >> 8) & 0xff;
+    // Operand types were guarded at record time (string | number only), so
+    // this cannot raise.
+    return TValue_t::GcObject(EValueTag::String,
+                              vm::CatSlow(pUni, pBase, nullptr, uFirst, uFirst + uCount - 1))
+        .uRaw;
+}
+
+std::uint64_t TraceHelpLen(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
+                           std::uint32_t uTop) {
+    (void)uTop;
+    auto* pTab = static_cast<C_GcTable*>(pBase[uDesc & 0xff].AsGcPointer());
+    return pTab->Length(*pUni);
+}
+
+}  // namespace ljx::jit
+
+namespace ljx::vm {
 
 // ---------------------------------------------------------------------------
 // Dispatch-table population & C++ entry points.

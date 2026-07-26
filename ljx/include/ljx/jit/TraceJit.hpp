@@ -156,6 +156,11 @@ private:
     [[nodiscard]] bool RecordTableSet(const vm::BcIns_t& ins, const vm::BcIns_t* pPc,
                                       vm::TValue_t tvKey, std::int32_t nTabSlot);
     [[nodiscard]] bool RecordForI(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
+    [[nodiscard]] bool RecordCat(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
+    [[nodiscard]] bool RecordLen(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
+    // Guard that the table in nTabSlot has no metatable (so no __newindex /
+    // __index can fire), shared by the new-key and absent-key paths.
+    [[nodiscard]] bool GuardNoMetatable(IrRef rTabPtr, const vm::BcIns_t* pResumePc);
     [[nodiscard]] bool RecordForL(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
     [[nodiscard]] bool RecordCall(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
     [[nodiscard]] bool RecordBuiltin(vm::EFastFunc eFfid, const vm::BcIns_t& ins,
@@ -222,5 +227,24 @@ private:
 };
 
 [[nodiscard]] bool TraceDebug() noexcept;
+
+// Runtime helpers compiled traces call (defined in vm/Interpreter.cpp, next
+// to the interpreter paths they mirror). ABI: (universe, entry base, packed
+// slot descriptor, stack extent in slots[, key immediate]). The trace has
+// written its full snapshot back to the Lua stack first, so the helper's
+// arguments are the slots themselves and every live value is a GC root; the
+// collector never moves objects, so register-resident pointers stay valid
+// across a collection triggered inside.
+std::uint64_t TraceHelpNewTab(vm::C_Universe* pUni, vm::TValue_t* pBase,
+                              std::uint32_t uDesc, std::uint32_t uTop);
+std::uint64_t TraceHelpSetNew(vm::C_Universe* pUni, vm::TValue_t* pBase,
+                              std::uint32_t uDesc, std::uint32_t uTop);
+std::uint64_t TraceHelpSetNewK(vm::C_Universe* pUni, vm::TValue_t* pBase,
+                               std::uint32_t uDesc, std::uint32_t uTop,
+                               std::uint64_t uKeyRaw);
+std::uint64_t TraceHelpCat(vm::C_Universe* pUni, vm::TValue_t* pBase,
+                           std::uint32_t uDesc, std::uint32_t uTop);
+std::uint64_t TraceHelpLen(vm::C_Universe* pUni, vm::TValue_t* pBase,
+                           std::uint32_t uDesc, std::uint32_t uTop);
 
 }  // namespace ljx::jit

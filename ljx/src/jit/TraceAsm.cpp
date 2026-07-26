@@ -83,10 +83,12 @@ public:
                const std::vector<IrConst_t>& vConst, const std::vector<Snapshot_t>& vSnap,
                const std::vector<SnapSlot_t>& vSnapSlots, const std::vector<IrRef>& vSlotValue,
                const std::vector<IrRef>& vSlotEntry, const std::vector<std::uint8_t>& vForce,
-               std::int32_t nSlotBias) noexcept
+               std::int32_t nSlotBias, vm::C_Universe* pUniverse,
+               std::int32_t nTopSlot) noexcept
         : m_vIns(vIns), m_vInsSnap(vInsSnap), m_vConst(vConst), m_vSnap(vSnap),
           m_vSnapSlots(vSnapSlots), m_vSlotValue(vSlotValue), m_vSlotEntry(vSlotEntry),
-          m_vForceHoist(vForce), m_nSlotBias(nSlotBias) {}
+          m_vForceHoist(vForce), m_nSlotBias(nSlotBias), m_pUniverse(pUniverse),
+          m_nTopSlot(nTopSlot) {}
 
     [[nodiscard]] bool Run();
 
@@ -123,6 +125,10 @@ private:
     void FreeDead(std::uint32_t uPos);
     void Pin(std::uint8_t uReg, bool bFloat);
     void UnpinAll();
+    void BuildLocs(std::uint16_t uSnap, std::vector<ExitLoc_t>& vLocs,
+                   const vm::BcIns_t*& pResumePc, std::int32_t& nBaseOffset);
+    void EmitStateStores(const std::vector<ExitLoc_t>& vLocs);
+    [[nodiscard]] bool EmitHelperCall(std::size_t uIdx, const void* pFn, bool bHasResult);
     [[nodiscard]] std::uint32_t BeginExit(std::uint16_t uSnap);
     void AddPatch(std::uint32_t uExit, std::size_t uPatch);
     [[nodiscard]] bool EmitOne(std::size_t uIdx);
@@ -137,6 +143,9 @@ private:
     const std::vector<IrRef>& m_vSlotEntry;
     const std::vector<std::uint8_t>& m_vForceHoist;
     std::int32_t m_nSlotBias;
+    vm::C_Universe* m_pUniverse;
+    std::int32_t m_nTopSlot;
+    bool m_bHasCalls = false;
 
     std::vector<std::size_t> m_vOrder;      // emission order (SLoads hoisted)
     std::vector<std::uint32_t> m_vLastUse;  // per IR index, position in m_vOrder
@@ -174,6 +183,22 @@ private:
 void C_TraceAsm::ComputeInvariance() {
     const std::size_t uCount = m_vIns.size();
     m_vInvariant.assign(uCount, 0);
+    // A helper that can CREATE keys can resize a table: its node and array
+    // vectors move. With such a call in the loop, no table field or memory
+    // load may be hoisted — each iteration re-reads them after the call.
+    bool bResizes = false;
+    m_bHasCalls = false;
+    for (const IrIns_t& insScan : m_vIns) {
+        switch (insScan.eOp) {
+            case EIrOp::CallSetNew: case EIrOp::CallSetNewK:
+                bResizes = true;
+                [[fallthrough]];
+            case EIrOp::CallNewTab: case EIrOp::CallCat: case EIrOp::CallLen:
+                m_bHasCalls = true;
+                break;
+            default: break;
+        }
+    }
     // A stack slot is loop-invariant exactly when the recorded iteration left
     // it holding the value it was entered with.
     std::vector<std::uint8_t> vSlotFixed(m_vSlotValue.size(), 0);
@@ -212,14 +237,18 @@ void C_TraceAsm::ComputeInvariance() {
             // End is unconditional control flow, not a guard: hoisting it
             // would leave the trace through snapshot 0 before the body ran.
             case EIrOp::End:
+            // Helper calls have effects (allocation, key creation) and their
+            // constant operands would otherwise satisfy the default rule.
+            case EIrOp::CallNewTab: case EIrOp::CallSetNew: case EIrOp::CallSetNewK:
+            case EIrOp::CallCat: case EIrOp::CallLen:
                 break;
             case EIrOp::LoadU32:
-                bInv = IsStableField(ins.rOp1) && Inv(ins.rOp1);
+                bInv = !bResizes && IsStableField(ins.rOp1) && Inv(ins.rOp1);
                 break;
             case EIrOp::LoadTV:
                 // Only the untyped form — that is the node key word, which a
                 // raw store never touches. Value loads stay in the loop.
-                bInv = ins.eType == EIrType::Int && Inv(ins.rOp1);
+                bInv = !bResizes && ins.eType == EIrType::Int && Inv(ins.rOp1);
                 break;
             default:
                 bInv = Inv(ins.rOp1) && Inv(ins.rOp2);
@@ -251,6 +280,15 @@ void C_TraceAsm::ComputeLiveness() {
     m_vSpilled.assign(uCount, 0);
     m_vNoSpill.assign(uCount, 0);
     if (m_vMemOnly.size() != uCount) m_vMemOnly.assign(uCount, 0);
+    // A helper call clobbers every caller-saved register, and in a LOOP the
+    // pre-roll's values are used again on the next iteration by code that was
+    // already emitted naming their registers. Entry SLoads are re-stored and
+    // reloaded around each call; everything else hoisted is demoted to
+    // memory — each use reloads it into a scratch, which no call can break.
+    if (m_bHasCalls && m_bLooping)
+        for (std::size_t uI = 0; uI < uCount; ++uI)
+            if (m_vInvariant[uI] && m_vIns[uI].eOp != EIrOp::SLoad)
+                m_vMemOnly[uI] = 1;
     const auto uEnd = static_cast<std::uint32_t>(m_vOrder.size());
 
     auto Use = [&](IrRef r, std::uint32_t uPos) {
@@ -422,14 +460,13 @@ std::uint8_t C_TraceAsm::OperandXmm(IrRef r, int nScratch) {
 
 // Captures the machine state a snapshot describes at the CURRENT program
 // point; the stub emitted later writes it back to the Lua stack.
-std::uint32_t C_TraceAsm::BeginExit(std::uint16_t uSnap) {
-    PendingExit_t exit;
-    // A hoisted guard runs before the loop body has changed anything, so its
-    // exit is the entry exit: resume at the trace head, restore nothing.
-    if (m_uPos < m_uHoisted) uSnap = 0;
+// Capture where every snapshot value lives RIGHT NOW — registers, spill
+// slots, or constants. Shared by exit stubs and helper-call write-backs.
+void C_TraceAsm::BuildLocs(std::uint16_t uSnap, std::vector<ExitLoc_t>& vLocs,
+                           const vm::BcIns_t*& pResumePc, std::int32_t& nBaseOffset) {
     const Snapshot_t& snap = m_vSnap[uSnap];
-    exit.pResumePc = static_cast<const vm::BcIns_t*>(snap.pResumePc);
-    exit.nBaseOffset = snap.nBaseOffset;
+    pResumePc = static_cast<const vm::BcIns_t*>(snap.pResumePc);
+    nBaseOffset = snap.nBaseOffset;
     for (std::uint32_t uS = 0; uS < snap.uSlotCount; ++uS) {
         const SnapSlot_t& ss = m_vSnapSlots[snap.uFirstSlot + uS];
         ExitLoc_t loc{};
@@ -445,11 +482,105 @@ std::uint32_t C_TraceAsm::BeginExit(std::uint16_t uSnap) {
             loc.bSpilled = loc.uReg == kNoReg;
             loc.uSpillIdx = static_cast<std::uint32_t>(uI);
         }
-        exit.vLocs.push_back(loc);
+        vLocs.push_back(loc);
     }
+}
+
+void C_TraceAsm::EmitStateStores(const std::vector<ExitLoc_t>& vLocs) {
+    for (const ExitLoc_t& loc : vLocs) {
+        const std::int32_t nDisp = loc.nSlot * 8;
+        if (loc.bConst) {
+            m_Emit.MovR64Imm64(kGprScratch[0], loc.uConst);
+            m_Emit.MovStoreR64(kGprScratch[0], kRegBase, nDisp);
+        } else if (loc.bSpilled) {
+            m_Emit.MovLoadR64(kGprScratch[0], kRsp, SpillDisp(loc.uSpillIdx));
+            m_Emit.MovStoreR64(kGprScratch[0], kRegBase, nDisp);
+        } else if (loc.bFloat) {
+            m_Emit.MovsdStore(loc.uReg, kRegBase, nDisp);
+        } else {
+            m_Emit.MovStoreR64(loc.uReg, kRegBase, nDisp);
+        }
+    }
+}
+
+std::uint32_t C_TraceAsm::BeginExit(std::uint16_t uSnap) {
+    PendingExit_t exit;
+    // A hoisted guard runs before the loop body has changed anything, so its
+    // exit is the entry exit: resume at the trace head, restore nothing.
+    if (m_uPos < m_uHoisted) uSnap = 0;
+    BuildLocs(uSnap, exit.vLocs, exit.pResumePc, exit.nBaseOffset);
     exit.uIrIdx = m_uCurIdx;
     m_vExits.push_back(std::move(exit));
     return static_cast<std::uint32_t>(m_vExits.size() - 1);
+}
+
+// A call into the trace runtime. The SysV call clobbers every caller-saved
+// register, so this is a full register-cache flush around a call:
+//   1. write the snapshot back to the Lua stack (GC roots + helper operands);
+//   2. store every live register to its native spill slot. Values are SSA —
+//      immutable once defined — so a slot written once stays correct; the
+//      exception is the entry SLoads, whose registers the back edge mutates,
+//      and those are re-stored at EVERY call and reloaded right after it.
+//   3. call; non-SLoad values reload lazily from their spill slots on use.
+bool C_TraceAsm::EmitHelperCall(std::size_t uIdx, const void* pFn, bool bHasResult) {
+    const IrIns_t& ins = m_vIns[uIdx];
+    const std::uint16_t uSnap = m_vInsSnap[uIdx];
+    // 1. Lua-stack write-back.
+    std::vector<ExitLoc_t> vLocs;
+    const vm::BcIns_t* pResumePc = nullptr;
+    std::int32_t nBaseOffset = 0;
+    BuildLocs(uSnap, vLocs, pResumePc, nBaseOffset);
+    EmitStateStores(vLocs);
+    // 2. flush the register cache.
+    for (std::uint32_t uR = 0; uR < 16; ++uR) {
+        if (const std::uint32_t uOwnG = m_vGprOwner[uR]) {
+            const std::size_t uOwn = uOwnG - 1;
+            if (!m_vSpilled[uOwn] || m_vIns[uOwn].eOp == EIrOp::SLoad)
+                m_Emit.MovStoreR64(static_cast<std::uint8_t>(uR), kRsp, SpillDisp(uOwn));
+            m_vSpilled[uOwn] = 1;
+            if (m_vIns[uOwn].eOp != EIrOp::SLoad) {
+                m_vGprOwner[uR] = 0;
+                m_vReg[uOwn] = kNoReg;
+            }
+        }
+        if (const std::uint32_t uOwnX = m_vXmmOwner[uR]) {
+            const std::size_t uOwn = uOwnX - 1;
+            if (!m_vSpilled[uOwn] || m_vIns[uOwn].eOp == EIrOp::SLoad)
+                m_Emit.MovsdStore(static_cast<std::uint8_t>(uR), kRsp, SpillDisp(uOwn));
+            m_vSpilled[uOwn] = 1;
+            if (m_vIns[uOwn].eOp != EIrOp::SLoad) {
+                m_vXmmOwner[uR] = 0;
+                m_vReg[uOwn] = kNoReg;
+            }
+        }
+    }
+    // 3. arguments and the call. Frame size keeps rsp 16-aligned here.
+    m_Emit.MovR64Imm64(7 /*rdi*/, reinterpret_cast<std::uint64_t>(m_pUniverse));
+    m_Emit.MovR64R64(6 /*rsi*/, kRegBase);
+    m_Emit.MovR32Imm(2 /*rdx*/, static_cast<std::uint32_t>(ConstOf(ins.rOp1)));
+    m_Emit.MovR32Imm(1 /*rcx*/, static_cast<std::uint32_t>(m_nTopSlot + 1));
+    if (ins.eOp == EIrOp::CallSetNewK)
+        m_Emit.MovR64Imm64(8 /*r8*/, ConstOf(ins.rOp2));
+    m_Emit.MovR64Imm64(0 /*rax*/, reinterpret_cast<std::uint64_t>(pFn));
+    m_Emit.CallRax();
+    // 4. capture the result FIRST — an entry SLoad may own rax, and its
+    // reload below would overwrite the return value.
+    if (bHasResult) {
+        std::uint8_t uDst = kNoReg;
+        if (!Allocate(uIdx, false, uDst)) return false;
+        m_Emit.MovR64R64(uDst, 0 /*rax*/);
+    }
+    // 5. the back-edge-mutable registers come back from their spill slots.
+    for (std::uint32_t uR = 0; uR < 16; ++uR) {
+        if (m_vGprOwner[uR] && m_vIns[m_vGprOwner[uR] - 1].eOp == EIrOp::SLoad &&
+            !(bHasResult && m_vGprOwner[uR] == static_cast<std::uint32_t>(uIdx) + 1))
+            m_Emit.MovLoadR64(static_cast<std::uint8_t>(uR), kRsp,
+                              SpillDisp(m_vGprOwner[uR] - 1));
+        if (m_vXmmOwner[uR] && m_vIns[m_vXmmOwner[uR] - 1].eOp == EIrOp::SLoad)
+            m_Emit.MovsdLoad(static_cast<std::uint8_t>(uR), kRsp,
+                             SpillDisp(m_vXmmOwner[uR] - 1));
+    }
+    return true;
 }
 
 void C_TraceAsm::AddPatch(std::uint32_t uExit, std::size_t uPatch) {
@@ -780,6 +911,17 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             return true;
         }
 
+        case EIrOp::CallNewTab:
+            return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpNewTab), true);
+        case EIrOp::CallSetNew:
+            return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpSetNew), false);
+        case EIrOp::CallSetNewK:
+            return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpSetNewK), false);
+        case EIrOp::CallCat:
+            return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpCat), true);
+        case EIrOp::CallLen:
+            return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpLen), true);
+
         case EIrOp::Loop:
             EmitBackEdge();
             return true;
@@ -968,7 +1110,7 @@ std::uint8_t* C_TraceJit::AllocCode(std::size_t uBytes) {
 
 Trace_t* C_TraceJit::Assemble() {
     C_TraceAsm asmb(m_vIns, m_vInsSnap, m_vConst, m_vSnapshots, m_vSnapSlots, m_vSlotValue,
-                    m_vSlotEntry, m_vForceHoist, kSlotBias);
+                    m_vSlotEntry, m_vForceHoist, kSlotBias, m_pUniverse, m_nTopSlot);
     if (!asmb.Run()) {
         if (TraceDebug()) std::fprintf(stderr, "[trace] backend refused the trace\n");
         return nullptr;

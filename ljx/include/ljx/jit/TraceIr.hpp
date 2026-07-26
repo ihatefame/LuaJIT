@@ -68,6 +68,14 @@ enum class EIrType : std::uint8_t {
     X(StoreTV)                                                                 \
     X(LoadU32)                                                                 \
     X(IncU32)         /* ++*(uint32*)ptr — the table version bump           */ \
+    /* runtime helper calls. Operands and results travel through Lua stack   */\
+    /* slots: the call is preceded by a full snapshot write-back, which both  */\
+    /* roots every live value for the GC and hands the helper its arguments. */\
+    X(CallNewTab)     /* rOp1 = desc const (TNew D field); -> tagged table   */ \
+    X(CallSetNew)     /* rOp1 = desc tab|key<<8|val<<16; creates a key       */ \
+    X(CallSetNewK)    /* rOp1 = desc tab|val<<16; rOp2 = key constant        */ \
+    X(CallCat)        /* rOp1 = desc first|count<<8; -> tagged string        */ \
+    X(CallLen)        /* rOp1 = desc table slot; -> length as Int            */ \
     /* control */                                                              \
     X(Loop)           /* the back edge                                      */ \
     X(End)            /* terminal: write everything back, leave the trace   */
@@ -90,6 +98,11 @@ enum class EIrOp : std::uint8_t {
         case EIrOp::SLoad:
         case EIrOp::SStore:
         case EIrOp::StoreTV:
+        case EIrOp::CallNewTab:
+        case EIrOp::CallSetNew:
+        case EIrOp::CallSetNewK:
+        case EIrOp::CallCat:
+        case EIrOp::CallLen:
         case EIrOp::Loop:
         case EIrOp::End:
             return false;

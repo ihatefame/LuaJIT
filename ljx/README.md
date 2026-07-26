@@ -1,8 +1,9 @@
 # LJX — a ground-up C++20 reimplementation of LuaJIT
 
 LJX is a clean-room Lua 5.1 VM built in modern C++20, following the architecture
-in [`ARCHITECTURE.md`](ARCHITECTURE.md). This tree is a **working interpreter**
-(phases 0–2 of the roadmap), not yet the trace JIT.
+in [`ARCHITECTURE.md`](ARCHITECTURE.md). This tree is a **working interpreter
+plus a native-code compiler for hot numeric loops** (roadmap phases 0–2, and
+the first increment of phase 3).
 
 ## What works today
 
@@ -31,6 +32,12 @@ A complete, self-contained Lua front-end and runtime:
   generic `for`, functions/closures/recursion/method calls, multiple returns
   and tailcalls, `and`/`or` short-circuit, metatables (`__index`,
   `__newindex`, `__add` … , `__eq`), `pcall`/`error`.
+- **Loop JIT** (`jit/LoopJit.hpp`) — hot counted `for` loops whose bodies are
+  straight-line number arithmetic are compiled to **x86-64 machine code**: entry
+  type guards, all live slots promoted to xmm registers for the whole loop,
+  register-to-register SSE, ascending/descending variants selected on the step
+  sign, and a clean bail-back to the interpreter when a guard fails. See
+  "The loop JIT" below.
 - **Stdlib (subset)** — `print type tostring tonumber pairs ipairs next
   setmetatable getmetatable rawget rawset assert error pcall collectgarbage`,
   plus `math`, `string` (`len sub rep byte char`, method syntax), `table`
@@ -54,25 +61,58 @@ make check      # unit tests + golden-output Lua regression tests
 ./ljx script.lua
 ```
 
+## The loop JIT
+
+`C_LoopJit` compiles a counted `for` loop the first time it is entered (a loop
+entered once may still iterate millions of times, so entry-counting would miss
+exactly the loops worth compiling; rejection is cached, so one-shot loops pay
+only microseconds).
+
+What it does:
+
+1. **Scans** the bytecode from `FORI+1` to the matching `FORL`. Only
+   straight-line number arithmetic is accepted (`Add/Sub/Mul/Div` in all
+   `VV`/`VN`/`NV` forms, `Mov`, `Unm`, `KShort`, `KNum`); anything else — a
+   call, a branch, a table op — rejects the loop, permanently, for that site.
+2. **Guards on entry**: the induction triple and every read-before-write input
+   slot must hold doubles. Guards run before any state is touched, so a failed
+   guard returns `1` and the interpreter runs the loop with no cleanup needed.
+3. **Promotes every live slot to an xmm register** for the whole loop —
+   loaded once before, stored back once after, so the interpreter and the GC
+   observe exactly what they would have. When the body never assigns the loop
+   variable (the common case) it reads straight out of the induction register.
+4. **Emits** register-to-register SSE, with `dst == lhs` collapsing to a single
+   instruction and commutativity exploited for `add`/`mul`. Register copies use
+   `movaps`, never `movsd reg,reg` — the latter *merges* the upper 64 bits,
+   creating a false dependency that serializes the loop (this one detail was
+   worth ~1.9× on the loop benchmark).
+5. **Specializes on step sign** at entry, emitting separate ascending and
+   descending loops so the iteration test is a single `ucomisd` + `jae`.
+
+`LJX_JITDEBUG=1` traces every compile decision (accepted, or why rejected).
+
 ## Benchmarks
 
-Interpreter-vs-interpreter is the honest comparison for this phase (LJX has no
-JIT yet). Best-of-5, this machine, against the LuaJIT 2.1 in `../src`:
+Best-of-7, this machine, against the LuaJIT 2.1 built in `../src`:
 
-| bench | LJX (interp) | LuaJIT `-joff` | ratio | LuaJIT (JIT) |
-|-------|-------------:|---------------:|------:|-------------:|
-| fib   | 0.31s | 0.27s | 1.17× | 0.04s |
-| loop  | 0.27s | 0.25s | 1.06× | 0.03s |
-| tab   | 0.06s | 0.06s | 1.13× | 0.02s |
-| str   | 0.29s | 0.09s | 3.19× | 0.06s |
+| bench | LJX (+loop JIT) | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
+|-------|----------------:|---------------:|-----------:|-------------:|-----------:|
+| loop  | **0.075s** | 0.323s | **4.28× faster** | 0.061s | 1.23× |
+| str   | **0.131s** | 0.142s | **1.08× faster** | 0.066s | 1.99× |
+| fib   | 0.415s | 0.325s | 0.78× | 0.058s | 7.20× |
+| tab   | 0.088s | 0.062s | 0.70× | 0.031s | 2.80× |
 
-On compute- and table-bound code the musttail CPS interpreter lands within
-**6–17%** of LuaJIT's hand-written assembly interpreter — validating the core
-thesis of the redesign. Strings are the current weak spot (per-op `std::string`
-construction + `snprintf` number formatting + stop-the-world interning churn);
-a rope/buffer path and a fast number formatter are the obvious next wins.
-Against full LuaJIT with the trace compiler, LJX is 5–9× slower, as expected
-until the JIT lands (roadmap phase 3).
+Reading this honestly:
+
+- **`loop`** is what the JIT was built for: 4.3× faster than LuaJIT's
+  hand-written assembly interpreter and within **1.23×** of its full trace
+  compiler.
+- **`str`** now edges past the assembly interpreter thanks to an allocation-free
+  concat path and a hand-rolled integer formatter.
+- **`fib`** (recursion) and **`tab`** (table stores) have no JIT coverage yet —
+  they run purely interpreted, where the musttail CPS interpreter sits 22–43%
+  behind hand-written assembly. Function calls and table access in compiled
+  code are the next two increments.
 
 ## Layout
 

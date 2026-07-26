@@ -7,6 +7,7 @@
 // from the frame link + the call instruction, exactly like the assembly VM.
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -14,6 +15,7 @@
 #include "ljx/rt/Meta.hpp"
 #include "ljx/rt/StringBuffer.hpp"
 #include "ljx/rt/StringInterner.hpp"
+#include "ljx/jit/LoopJit.hpp"
 #include "ljx/vm/Interpreter.hpp"
 
 namespace ljx::vm {
@@ -412,26 +414,71 @@ LJX_H(Pow) {
     LJX_NEXT();
 }
 
+// Fast number→text: integer path is hand-rolled (the overwhelmingly common
+// case in concatenation); the general path falls back to %.14g.
+LJX_FORCEINLINE std::uint32_t FormatNumber(char* pOut, double flValue) noexcept {
+    std::int32_t nInt;
+    if (core::NumToInt32Check(flValue, nInt)) {
+        char* pCursor = pOut;
+        std::uint32_t uAbs;
+        if (nInt < 0) {
+            *pCursor++ = '-';
+            uAbs = static_cast<std::uint32_t>(-static_cast<std::int64_t>(nInt));
+        } else {
+            uAbs = static_cast<std::uint32_t>(nInt);
+        }
+        char vDigits[10];
+        int nCount = 0;
+        do {
+            vDigits[nCount++] = static_cast<char>('0' + uAbs % 10);
+            uAbs /= 10;
+        } while (uAbs);
+        while (nCount) *pCursor++ = vDigits[--nCount];
+        return static_cast<std::uint32_t>(pCursor - pOut);
+    }
+    return static_cast<std::uint32_t>(std::snprintf(pOut, 40, "%.14g", flValue));
+}
+
 // Out of line: musttail cannot cross a scope with non-trivial destructors.
 LJX_NOINLINE C_GcString* CatSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_t* pPc,
                                  std::uint32_t uFirst, std::uint32_t uLast) {
-    char vNumBuf[32];
-    std::string sResult;
+    // Stack buffer covers virtually all concatenations; spill to the heap
+    // only for large results. No std::string on this path.
+    char vStack[512];
+    char* pBuf = vStack;
+    std::size_t uCapacity = sizeof vStack;
+    std::size_t uLen = 0;
+    char* pHeap = nullptr;
     for (std::uint32_t uI = uFirst; uI <= uLast; ++uI) {
         const TValue_t tvValue = pBase[uI];
+        const char* pPiece;
+        std::size_t uPieceLen;
+        char vNumBuf[40];
         if (tvValue.Is(EValueTag::String)) {
             auto* pStr = static_cast<C_GcString*>(tvValue.AsGcPointer());
-            sResult.append(pStr->Data(), pStr->Length());
+            pPiece = pStr->Data();
+            uPieceLen = pStr->Length();
         } else if (tvValue.IsDouble()) {
-            const int nLen = std::snprintf(vNumBuf, sizeof vNumBuf, "%.14g",
-                                           tvValue.AsDouble());
-            sResult.append(vNumBuf, static_cast<std::size_t>(nLen));
+            uPieceLen = FormatNumber(vNumBuf, tvValue.AsDouble());
+            pPiece = vNumBuf;
         } else {
+            std::free(pHeap);
             ErrorAtPc(pUni, pBase, pPc, "attempt to concatenate a %s value",
                       TypeName(tvValue));
         }
+        if (uLen + uPieceLen > uCapacity) [[unlikely]] {
+            uCapacity = (uLen + uPieceLen) * 2;
+            char* pNew = static_cast<char*>(std::malloc(uCapacity));
+            std::memcpy(pNew, pBuf, uLen);
+            std::free(pHeap);
+            pHeap = pBuf = pNew;
+        }
+        std::memcpy(pBuf + uLen, pPiece, uPieceLen);
+        uLen += uPieceLen;
     }
-    return pUni->Interner().Intern(sResult);
+    C_GcString* pResult = pUni->Interner().Intern(std::string_view(pBuf, uLen));
+    std::free(pHeap);
+    return pResult;
 }
 
 LJX_H(Cat) {
@@ -822,6 +869,22 @@ LJX_H(ForI) {
     if (!(pSlots[0].IsDouble() && pSlots[1].IsDouble() && pSlots[2].IsDouble()))
         [[unlikely]]
         ErrorAtPc(pUni, pBase, pPc, "'for' initial value must be a number%s", "");
+    // Hot counted loop → native code. On success it runs every iteration and
+    // we resume past the loop; a failed entry guard (return 1) falls back to
+    // the interpreter transparently.
+    if (jit::C_LoopJit* pJit = pUni->LoopJit()) [[likely]] {
+        jit::CompiledLoop_f fnLoop =
+            pJit->LookupOrTick(pPc - 1, static_cast<std::uint8_t>(uRa));
+        if (fnLoop) {
+            const TValue_t* pKNum = pKBase;  // number constants base
+            if (fnLoop(pBase, reinterpret_cast<const double*>(pKNum)) == 0) {
+                const BcIns_t insSelf{pPc[-1].uRaw};
+                pPc += insSelf.JumpTarget();  // loop complete: resume after it
+                LJX_NEXT();
+            }
+            // Guard failed: fall through to the interpreter for this run.
+        }
+    }
     const double flIdx = pSlots[0].AsDouble();
     const double flStop = pSlots[1].AsDouble();
     const double flStep = pSlots[2].AsDouble();

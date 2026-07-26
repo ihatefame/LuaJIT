@@ -26,6 +26,9 @@ class C_MetaResolver;
 namespace ljx::gc {
 class C_GarbageCollector;
 }
+namespace ljx::jit {
+class C_LoopJit;
+}
 
 namespace ljx::vm {
 
@@ -212,6 +215,8 @@ public:
     [[nodiscard]] rt::C_MetaResolver& Meta() noexcept { return *m_pMeta; }
     [[nodiscard]] gc::C_GarbageCollector& Gc() noexcept { return *m_pGc; }
     [[nodiscard]] core::C_Prng& Prng() noexcept { return m_Prng; }
+    [[nodiscard]] jit::C_LoopJit* LoopJit() noexcept { return m_pLoopJit; }
+    void SetLoopJit(jit::C_LoopJit* pJit) noexcept { m_pLoopJit = pJit; }
 
     // Compressed-ref decompression against this universe's arena.
     template <typename TObj>
@@ -273,6 +278,7 @@ public:
     std::uint32_t m_uEntryResults = 0;  // results of the innermost C-entry frame
     ErrorFrame_t* m_pErrorTop = nullptr;   // current protected-call boundary
     TValue_t m_tvErrorValue;               // error object across the longjmp
+    jit::C_LoopJit* m_pLoopJit = nullptr;  // counted-loop native compiler
 };
 static_assert(std::is_standard_layout_v<C_Universe>,
               "offset-addressed from the pinned context register");

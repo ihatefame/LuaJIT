@@ -10,6 +10,7 @@
 #include "ljx/rt/Meta.hpp"
 #include "ljx/rt/StringInterner.hpp"
 #include "ljx/vm/Interpreter.hpp"
+#include "ljx/jit/LoopJit.hpp"
 #include "ljx/vm/Object.hpp"
 
 namespace ljx::vm {
@@ -83,6 +84,9 @@ C_Universe* C_Universe::Create(std::size_t uArenaReserveBytes) noexcept {
     pUni->m_pRegistry = C_GcTable::New(*pUni, 0, 2);
 
     pUni->m_insCFuncHeader = BcIns_t::MakeAD(EBcOp::FuncC, 0, 0);
+    auto* pLoopJit = new (pAlloc->AllocGcObject(sizeof(jit::C_LoopJit)))
+        jit::C_LoopJit(*pUni);
+    pUni->SetLoopJit(pLoopJit);
     C_Interpreter::InitDispatchTables(pUni->m_Dispatch);
     return pUni;
 }

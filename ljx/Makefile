@@ -3,7 +3,7 @@ CXX := clang++-18
 CXXFLAGS := -std=c++20 -O2 -g -Wall -Wextra -Iinclude
 
 SRC := $(wildcard src/core/*.cpp) $(wildcard src/rt/*.cpp) $(wildcard src/gc/*.cpp) \
-       $(wildcard src/vm/*.cpp) $(wildcard src/fe/*.cpp)
+       $(wildcard src/vm/*.cpp) $(wildcard src/fe/*.cpp) $(wildcard src/jit/*.cpp)
 OBJ := $(patsubst src/%.cpp,build/%.o,$(SRC))
 
 all: ljx ljx_test

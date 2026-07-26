@@ -58,7 +58,12 @@ void ToStringBuf(C_Universe& uni, const TValue_t& tvValue, std::string& sOut) {
         auto* pStr = static_cast<C_GcString*>(tvValue.AsGcPointer());
         sOut.assign(pStr->Data(), pStr->Length());
     } else if (tvValue.IsDouble()) {
-        std::snprintf(vBuffer, sizeof vBuffer, "%.14g", tvValue.AsDouble());
+        const double flValue = tvValue.AsDouble();
+        std::int32_t nInt;
+        if (core::NumToInt32Check(flValue, nInt))
+            std::snprintf(vBuffer, sizeof vBuffer, "%d", nInt);
+        else
+            std::snprintf(vBuffer, sizeof vBuffer, "%.14g", flValue);
         sOut = vBuffer;
     } else if (tvValue.IsNil()) {
         sOut = "nil";

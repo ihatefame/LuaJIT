@@ -288,6 +288,10 @@ public:
     jit::C_LoopJit* m_pLoopJit = nullptr;  // counted-loop native compiler
     jit::C_FuncJit* m_pFuncJit = nullptr;  // whole-function native compiler
     jit::C_TraceJit* m_pTraceJit = nullptr;   // trace compiler
+    // The Lua-stack base of the trace segment that finally exited: linked
+    // traces shift rbx as control jumps between them, and the epilogue's pops
+    // restore the C++ caller's registers, so the base comes back through here.
+    TValue_t* m_pTraceExitBase = nullptr;
     // Non-zero while the trace recorder is observing the instruction stream.
     // The two pattern-matching tiers and the collector step aside for it: a
     // tier that runs a whole loop or function natively would hide those

@@ -1079,49 +1079,29 @@ struct TraceResume_t {
 
 LJX_NOINLINE TraceResume_t RunTrace(jit::Trace_t* pTrace, TValue_t* pBase,
                                     C_Universe* pUni) {
-    C_LuaThread* pThread = pUni->MainThread();
-    // The chain loop: a trace's exit either returns to the interpreter or
-    // names a CHILD — a side trace grown from that exit, or the loop trace a
-    // stem/side trace links back into. Execution ping-pongs between compiled
-    // segments here with no interpreter dispatch in between; the seam cost is
-    // one call plus the snapshot write-back/reload through L1.
-    for (;;) {
-        ++pTrace->uEntries;
-        auto fnTrace = reinterpret_cast<jit::TraceEntry_f>(pTrace->pCode);
-        const std::uint32_t uExit = fnTrace(pBase, pUni->ArenaBase());
-        TValue_t* pReach = pBase + pTrace->nTopSlot + 1;
-        if (pReach > pThread->m_pHighWater) pThread->m_pHighWater = pReach;
-        jit::TraceExit_t& exit = pTrace->vExits[uExit];
-        if (jit::TraceDebug() && pTrace->uEntries <= 8)
-            std::fprintf(stderr, "[trace] #%u entry %llu -> exit %u (%s @%p base%+d)%s\n",
-                         pTrace->uNumber,
-                         static_cast<unsigned long long>(pTrace->uEntries), uExit,
-                         OpName(exit.pResumePc->Op()),
-                         static_cast<const void*>(exit.pResumePc), exit.nBaseOffset,
-                         exit.pChild ? " -> child" : "");
-        pBase += exit.nBaseOffset;
-        if (exit.pChild) {
-            if (jit::TraceDebug())
-                std::fprintf(stderr, "[chain] #%u exit %u -> #%u (base%+d)\n",
-                             pTrace->uNumber, uExit, exit.pChild->uNumber,
-                             exit.nBaseOffset);
-            pTrace = exit.pChild;
-            continue;
-        }
-        // Exit heat: a hot exit grows a side trace (or links to an existing
-        // trace at its resume point), so the next time through this path
-        // stays compiled.
-        if (exit.uCount < jit::C_TraceJit::kBlacklistCount &&
-            ++exit.uCount == jit::C_TraceJit::kHotExitThreshold) {
-            const C_GcProto* pProto = FrameProto(pUni, pBase);
-            pUni->TraceJit()->OnHotExit(pTrace, uExit, pBase, KBaseOf(pUni, pProto));
-            if (jit::TraceExit_t& re = pTrace->vExits[uExit]; re.pChild) {
-                pTrace = re.pChild;
-                continue;
-            }
-        }
-        return TraceResume_t{exit.pResumePc, pBase};
+    // ONE call: linked traces jump between each other directly (uniform
+    // frames, patched exit stubs), and whichever segment finally exits
+    // returns a GLOBAL exit id with its base parked in m_pTraceExitBase.
+    ++pTrace->uEntries;
+    auto fnTrace = reinterpret_cast<jit::TraceEntry_f>(pTrace->pCode);
+    const std::uint32_t uGid = fnTrace(pBase, pUni->ArenaBase());
+    const jit::GlobalExit_t& ge = pUni->TraceJit()->GlobalExitAt(uGid);
+    jit::Trace_t* pOwner = ge.pOwner;
+    jit::TraceExit_t& exit = pOwner->vExits[ge.uExit];
+    pBase = pUni->m_pTraceExitBase + exit.nBaseOffset;
+    if (jit::TraceDebug() && pOwner->uEntries <= 8)
+        std::fprintf(stderr, "[trace] #%u -> exit %u (%s @%p base%+d)\n", pOwner->uNumber,
+                     ge.uExit, OpName(exit.pResumePc->Op()),
+                     static_cast<const void*>(exit.pResumePc), exit.nBaseOffset);
+    // Exit heat: a hot exit grows a side trace (or links to an existing trace
+    // at its resume point) and its stub is patched into a direct jump — this
+    // path then never comes back here.
+    if (exit.uCount < jit::C_TraceJit::kBlacklistCount &&
+        ++exit.uCount == jit::C_TraceJit::kHotExitThreshold) {
+        const C_GcProto* pProto = FrameProto(pUni, pBase);
+        pUni->TraceJit()->OnHotExit(pOwner, ge.uExit, pBase, KBaseOf(pUni, pProto));
     }
+    return TraceResume_t{exit.pResumePc, pBase};
 }
 
 // Turns a loop op into its J-variant once a trace exists for it, so the entry

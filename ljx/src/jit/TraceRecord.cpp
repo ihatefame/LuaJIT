@@ -547,17 +547,58 @@ void C_TraceJit::FinishTrace(Trace_t* pTrace, Trace_t* pLinkTarget) {
     pTrace->nTopSlot = m_nTopSlot;
     pTrace->uDepth = pOrigin ? pOrigin->uDepth + 1 : 0;
     pTrace->uNumber = static_cast<std::uint32_t>(m_vTraces.size());
+    // Commit the exits to the global registry — the ids the stubs return were
+    // assigned from the registry size Assemble saw.
+    for (std::uint32_t uE = 0; uE < pTrace->vExits.size(); ++uE)
+        m_vExitRegistry.push_back(GlobalExit_t{pTrace, uE});
     m_vTraces.push_back(pTrace);
     // Registered by start PC even for side traces: a later recording that
     // reaches this PC links here instead of recording the region again.
     m_mapTraces[m_pStartPc] = pTrace;
-    if (pTrace->nLinkExit >= 0 && pLinkTarget)
+    if (pTrace->nLinkExit >= 0 && pLinkTarget) {
         pTrace->vExits[static_cast<std::size_t>(pTrace->nLinkExit)].pChild = pLinkTarget;
-    if (pOrigin) pOrigin->vExits[uOriginExit].pChild = pTrace;
+        PatchExitToChild(pTrace, static_cast<std::uint32_t>(pTrace->nLinkExit));
+    }
+    if (pOrigin) {
+        pOrigin->vExits[uOriginExit].pChild = pTrace;
+        PatchExitToChild(pOrigin, uOriginExit);
+    }
     if (TraceDebug())
         std::fprintf(stderr, "[trace] #%u compiled: %zu ins, %zu exits%s%s\n",
                      pTrace->uNumber, m_vIns.size(), pTrace->vExits.size(),
                      pOrigin ? " (side)" : "", pLinkTarget ? " (linked)" : "");
+}
+
+// Rewrite an exit's stub tail into a direct jump: [lea rbx, [rbx+disp]] +
+// jmp child-body + nop padding, within the 16 bytes the stub reserved. From
+// then on that path never touches the interpreter, the chain loop, or even a
+// call instruction — the write-back stores flow straight into the child's
+// preamble loads.
+void C_TraceJit::PatchExitToChild(Trace_t* pParent, std::uint32_t uExit) {
+    TraceExit_t& exit = pParent->vExits[uExit];
+    if (!exit.pChild || exit.uPatchOfs == 0 || !exit.pChild->pCode) return;
+    std::uint8_t* pSite = static_cast<std::uint8_t*>(pParent->pCode) + exit.uPatchOfs;
+    std::uint8_t vBuf[16];
+    std::size_t uLen = 0;
+    const std::int32_t nDisp = exit.nBaseOffset * 8;
+    if (nDisp != 0) {
+        vBuf[uLen++] = 0x48;   // lea rbx, [rbx + disp32]
+        vBuf[uLen++] = 0x8D;
+        vBuf[uLen++] = 0x9B;
+        std::memcpy(vBuf + uLen, &nDisp, 4);
+        uLen += 4;
+    }
+    const std::uint8_t* pTarget =
+        static_cast<const std::uint8_t*>(exit.pChild->pCode) + exit.pChild->uBodyOfs;
+    const auto nRel =
+        static_cast<std::int32_t>(pTarget - (pSite + uLen + 5));
+    vBuf[uLen++] = 0xE9;       // jmp rel32
+    std::memcpy(vBuf + uLen, &nRel, 4);
+    uLen += 4;
+    while (uLen < sizeof vBuf) vBuf[uLen++] = 0x90;
+    std::memcpy(pSite, vBuf, sizeof vBuf);
+    __builtin___clear_cache(reinterpret_cast<char*>(pSite),
+                            reinterpret_cast<char*>(pSite + sizeof vBuf));
 }
 
 void C_TraceJit::OnHotExit(Trace_t* pParent, std::uint32_t uExit, TValue_t* pBase,
@@ -579,6 +620,7 @@ void C_TraceJit::OnHotExit(Trace_t* pParent, std::uint32_t uExit, TValue_t* pBas
     if (const auto it = m_mapTraces.find(exit.pResumePc);
         it != m_mapTraces.end() && it->second != pParent) {
         exit.pChild = it->second;
+        PatchExitToChild(pParent, uExit);
         if (TraceDebug())
             std::fprintf(stderr, "[trace] #%u exit %u linked to #%u\n", pParent->uNumber,
                          uExit, it->second->uNumber);

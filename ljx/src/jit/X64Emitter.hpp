@@ -387,6 +387,12 @@ public:
         U8(0x0F); U8(0x54);
         U8(static_cast<std::uint8_t>(0xC0 | ((uDst & 7) << 3) | (uSrc & 7)));
     }
+    // cmp r64, [base+disp32]   REX.W 3B /r
+    void CmpR64Mem(std::uint8_t uReg, std::uint8_t uBase, std::int32_t nDisp) {
+        RexRegRm(uReg, uBase, true);
+        U8(0x3B);
+        ModRmDisp(uReg, uBase, nDisp);
+    }
     // sub/add rsp, imm32
     void SubRspImm32(std::uint32_t u) { U8(0x48); U8(0x81); U8(0xEC); U32(u); }
     void AddRspImm32(std::uint32_t u) { U8(0x48); U8(0x81); U8(0xC4); U32(u); }

@@ -40,6 +40,7 @@ struct Trace_t;
 struct TraceExit_t {
     const vm::BcIns_t* pResumePc = nullptr;
     std::int32_t nBaseOffset = 0;
+    std::uint32_t uPatchOfs = 0;   // stub tail offset in the code (see linking)
     // A hot exit grows a SIDE TRACE: execution transfers here instead of
     // returning to the interpreter, so branchy code stays compiled. The chain
     // parent -> child -> ... -> (link back to a loop trace) runs entirely in
@@ -50,11 +51,24 @@ struct TraceExit_t {
 
 // Entry ABI of compiled trace code:
 //   uint32 fn(TValue_t* pBase, std::uintptr_t uArenaBase)
-// returns the index of the exit that was taken.
+// returns the GLOBAL id of the exit that was taken (C_TraceJit's registry).
+// Control may have travelled through many linked traces by then: every trace
+// uses the SAME frame size and pushes the same registers, so a hot exit jumps
+// straight into a child's body (past its prologue) and whichever segment
+// finally exits unwinds the one frame the root entry built. The exit stub
+// parks the final segment's base in C_Universe::m_pTraceExitBase, because the
+// epilogue's pops restore the caller's rbx.
 using TraceEntry_f = std::uint32_t (*)(vm::TValue_t* pBase, std::uintptr_t uArenaBase);
+
+// Registry entry resolving a global exit id back to its trace.
+struct GlobalExit_t {
+    Trace_t* pOwner = nullptr;
+    std::uint32_t uExit = 0;
+};
 
 struct Trace_t {
     void* pCode = nullptr;
+    std::uint32_t uBodyOfs = 0;    // entry point PAST the prologue (chain jumps)
     const vm::BcIns_t* pStartPc = nullptr;
     std::vector<TraceExit_t> vExits;
     std::int32_t nTopSlot = 0;      // highest stack slot the trace touches
@@ -75,7 +89,10 @@ public:
     static constexpr std::uint32_t kMaxInlineDepth = 5;
     static constexpr std::uint32_t kHotExitThreshold = 12;   // side-trace trigger
     static constexpr std::uint32_t kMaxSideDepth = 8;        // per-chain variant cap
-    static constexpr std::size_t kCodeArenaSize = 4u << 20;
+    static constexpr std::size_t kCodeArenaSize = 8u << 20;
+    // One spill frame layout for every trace: what makes cross-trace jumps
+    // possible. kMaxIrIns spill slots, and the odd 8 keeps calls 16-aligned.
+    static constexpr std::uint32_t kTraceFrameBytes = kMaxIrIns * 8 + 8;
 
     explicit C_TraceJit(vm::C_Universe& uni) noexcept : m_pUniverse(&uni) {}
     ~C_TraceJit();
@@ -107,6 +124,9 @@ public:
     void AbortForReentry() { AbortRecording(EAbort::Unsupported, "interpreter re-entry"); }
 
     [[nodiscard]] std::size_t TraceCount() const noexcept { return m_vTraces.size(); }
+    [[nodiscard]] const GlobalExit_t& GlobalExitAt(std::uint32_t uGid) const noexcept {
+        return m_vExitRegistry[uGid];
+    }
 
 private:
     // --- recording ----------------------------------------------------------
@@ -120,6 +140,9 @@ private:
     // Common tail of CloseLoop/CloseLink: register, attach to the origin exit
     // for side traces, blacklist the origin when compilation failed.
     void FinishTrace(Trace_t* pTrace, Trace_t* pLinkTarget);
+    // Rewrites an exit's stub tail from "return global id" into a direct jump
+    // into the child's body (with an rbx adjustment when frames differ).
+    void PatchExitToChild(Trace_t* pParent, std::uint32_t uExit);
     void DumpIr() const;
     void FinalizeSnapshots();
     [[nodiscard]] bool RecordOne(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
@@ -218,6 +241,7 @@ private:
 
     void PinValue(const vm::TValue_t& tvValue);
 
+    std::vector<GlobalExit_t> m_vExitRegistry;
     std::unordered_map<const vm::BcIns_t*, std::uint32_t> m_mapHot;
     std::unordered_map<const vm::BcIns_t*, Trace_t*> m_mapTraces;
     std::vector<Trace_t*> m_vTraces;

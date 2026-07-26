@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 
 #include "ljx/jit/TraceJit.hpp"
+#include "ljx/vm/Interpreter.hpp"
 #include "ljx/vm/Object.hpp"
 #include "X64Emitter.hpp"
 
@@ -75,6 +76,7 @@ struct PendingExit_t {
     const vm::BcIns_t* pResumePc;
     std::int32_t nBaseOffset;
     std::size_t uIrIdx = 0;
+    std::size_t uPatchOfs = 0;    // stub tail: patched into a direct chain jump
 };
 
 class C_TraceAsm {
@@ -84,13 +86,14 @@ public:
                const std::vector<SnapSlot_t>& vSnapSlots, const std::vector<IrRef>& vSlotValue,
                const std::vector<IrRef>& vSlotEntry, const std::vector<std::uint8_t>& vForce,
                std::int32_t nSlotBias, vm::C_Universe* pUniverse,
-               std::int32_t nTopSlot) noexcept
+               std::int32_t nTopSlot, std::uint32_t uGidBase) noexcept
         : m_vIns(vIns), m_vInsSnap(vInsSnap), m_vConst(vConst), m_vSnap(vSnap),
           m_vSnapSlots(vSnapSlots), m_vSlotValue(vSlotValue), m_vSlotEntry(vSlotEntry),
           m_vForceHoist(vForce), m_nSlotBias(nSlotBias), m_pUniverse(pUniverse),
-          m_nTopSlot(nTopSlot) {}
+          m_nTopSlot(nTopSlot), m_uGidBase(uGidBase) {}
 
     [[nodiscard]] bool Run();
+    [[nodiscard]] std::size_t BodyOfs() const noexcept { return m_uBodyOfs; }
 
 private:
     [[nodiscard]] bool RunOnce();
@@ -145,6 +148,8 @@ private:
     std::int32_t m_nSlotBias;
     vm::C_Universe* m_pUniverse;
     std::int32_t m_nTopSlot;
+    std::uint32_t m_uGidBase;
+    std::size_t m_uBodyOfs = 0;
     bool m_bHasCalls = false;
 
     std::vector<std::size_t> m_vOrder;      // emission order (SLoads hoisted)
@@ -1001,14 +1006,30 @@ void C_TraceAsm::EmitBackEdge() {
 bool C_TraceAsm::RunOnce() {
     if (m_vIns.empty()) return false;
     ComputeLiveness();
-    const std::size_t uFrame = ((m_vIns.size() * 8 + 15) & ~std::size_t{15}) + 8;
 
     // --- prologue -----------------------------------------------------------
+    // EVERY trace pushes the same registers and reserves the same frame, so a
+    // linked trace can be entered at m_uBodyOfs (past the prologue) and the
+    // final segment's epilogue unwinds the one frame the root entry built.
     m_Emit.PushR64(3); m_Emit.PushR64(5); m_Emit.PushR64(12);
     m_Emit.PushR64(13); m_Emit.PushR64(14); m_Emit.PushR64(15);
-    m_Emit.SubRspImm32(static_cast<std::uint32_t>(uFrame));
+    m_Emit.SubRspImm32(C_TraceJit::kTraceFrameBytes);
     m_Emit.MovR64R64(kRegBase, kRdi);
     m_Emit.MovR64R64(kRegArena, kRsi);
+    m_uBodyOfs = m_Emit.Here();
+    // Raise the collector's high-water mark over this segment's slot extent —
+    // chain segments run at shifted bases the C++ layer never sees, so each
+    // segment accounts for its own reach.
+    {
+        vm::C_LuaThread* pThread = m_pUniverse->MainThread();
+        m_Emit.MovR64Imm64(kGprScratch[0],
+                           reinterpret_cast<std::uint64_t>(&pThread->m_pHighWater));
+        m_Emit.LeaDisp(kGprScratch[1], kRegBase, (m_nTopSlot + 1) * 8);
+        m_Emit.CmpR64Mem(kGprScratch[1], kGprScratch[0], 0);
+        const std::size_t uSkip = m_Emit.Jcc(kCcBe);
+        m_Emit.MovStoreR64(kGprScratch[1], kGprScratch[0], 0);
+        m_Emit.PatchToHere(uSkip);
+    }
 
     // --- preamble + body ----------------------------------------------------
     bool bAtLoopTop = false;
@@ -1068,14 +1089,23 @@ bool C_TraceAsm::RunOnce() {
                 m_Emit.MovStoreR64(loc.uReg, kRegBase, nDisp);
             }
         }
-        m_Emit.MovR32Imm(kRax, uE);
+        // The chain may have shifted rbx; the epilogue's pops restore the C++
+        // caller's registers, so the final base travels through the universe.
+        m_Emit.MovR64Imm64(kGprScratch[0],
+                           reinterpret_cast<std::uint64_t>(&m_pUniverse->m_pTraceExitBase));
+        m_Emit.MovStoreR64(kRegBase, kGprScratch[0], 0);
+        // Patchable tail (16 bytes): today "return the global exit id"; once a
+        // child exists, PatchExitToChild rewrites it into lea rbx + jmp body.
+        exit.uPatchOfs = m_Emit.Here();
+        m_Emit.MovR32Imm(kRax, m_uGidBase + uE);
         vToEpilogue.push_back(m_Emit.Jmp());
+        for (int nPad = 0; nPad < 6; ++nPad) m_Emit.U8(0x90);
     }
 
     // --- epilogue -----------------------------------------------------------
     const std::size_t uEpilogue = m_Emit.Here();
     for (std::size_t uPatch : vToEpilogue) m_Emit.PatchTo(uPatch, uEpilogue);
-    m_Emit.AddRspImm32(static_cast<std::uint32_t>(uFrame));
+    m_Emit.AddRspImm32(C_TraceJit::kTraceFrameBytes);
     m_Emit.PopR64(15); m_Emit.PopR64(14); m_Emit.PopR64(13);
     m_Emit.PopR64(12); m_Emit.PopR64(5); m_Emit.PopR64(3);
     m_Emit.Ret();
@@ -1124,7 +1154,8 @@ std::uint8_t* C_TraceJit::AllocCode(std::size_t uBytes) {
 
 Trace_t* C_TraceJit::Assemble() {
     C_TraceAsm asmb(m_vIns, m_vInsSnap, m_vConst, m_vSnapshots, m_vSnapSlots, m_vSlotValue,
-                    m_vSlotEntry, m_vForceHoist, kSlotBias, m_pUniverse, m_nTopSlot);
+                    m_vSlotEntry, m_vForceHoist, kSlotBias, m_pUniverse, m_nTopSlot,
+                    static_cast<std::uint32_t>(m_vExitRegistry.size()));
     if (!asmb.Run()) {
         if (TraceDebug()) std::fprintf(stderr, "[trace] backend refused the trace\n");
         return nullptr;
@@ -1136,9 +1167,14 @@ Trace_t* C_TraceJit::Assemble() {
                             reinterpret_cast<char*>(pCode + asmb.m_Emit.Size()));
     auto* pTrace = new Trace_t;
     pTrace->pCode = pCode;
+    pTrace->uBodyOfs = static_cast<std::uint32_t>(asmb.BodyOfs());
     for (std::size_t uE = 0; uE < asmb.m_vExits.size(); ++uE) {
         const PendingExit_t& exit = asmb.m_vExits[uE];
-        pTrace->vExits.push_back(TraceExit_t{exit.pResumePc, exit.nBaseOffset});
+        TraceExit_t out;
+        out.pResumePc = exit.pResumePc;
+        out.nBaseOffset = exit.nBaseOffset;
+        out.uPatchOfs = static_cast<std::uint32_t>(exit.uPatchOfs);
+        pTrace->vExits.push_back(out);
         if (m_vIns[exit.uIrIdx].eOp == EIrOp::End)
             pTrace->nLinkExit = static_cast<std::int32_t>(uE);
     }

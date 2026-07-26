@@ -52,7 +52,7 @@ LJX_FORCEINLINE C_GcFunction* FrameFunc(TValue_t* pBase) noexcept {
 
 LJX_FORCEINLINE const C_GcProto* FrameProto(C_Universe* pUni, TValue_t* pBase) noexcept {
     return C_GcProto::FromBytecode(static_cast<const std::uint32_t*>(
-        core::RefToPtr(pUni->ArenaBase(), FrameFunc(pBase)->m_rPc)));
+        FrameFunc(pBase)->m_pPc));
 }
 
 LJX_FORCEINLINE const TValue_t* KBaseOf(C_Universe* pUni, const C_GcProto* pProto) noexcept {
@@ -109,6 +109,17 @@ LJX_NOINLINE void GcCheck(C_Universe* pUni, TValue_t* pBase) {
 // Number coercion for arithmetic (strings are NOT coerced in v1).
 LJX_FORCEINLINE bool BothNumbers(const TValue_t& tvA, const TValue_t& tvB) noexcept {
     return static_cast<int>(tvA.IsDouble()) & static_cast<int>(tvB.IsDouble());
+}
+
+// Load a slot's payload straight into the FP domain. Going through
+// TValue_t::AsDouble() would bit_cast the integer the tag check already
+// loaded, and the compiler turns that into a GPR->XMM `movq`; reloading from
+// the same address instead keeps the value in the FP domain (the second load
+// is free — it hits the same cache line the tag check just touched).
+LJX_FORCEINLINE double LoadNum(const TValue_t& tvValue) noexcept {
+    double flValue;
+    std::memcpy(&flValue, &tvValue, sizeof flValue);
+    return flValue;
 }
 
 // Reentrant metamethod invocation (v1: nested dispatch loop via a fresh
@@ -251,8 +262,7 @@ LJX_PRESERVE_NONE void CallDispatch(LJX_HANDLER_ARGS) {
     auto* pFn = static_cast<C_GcFunction*>(tvFunc.AsGcPointer());
     pBase[uRa + 1] = TValue_t{FrameLink_t::FromReturnPc(pPc).uRaw};
     TValue_t* pNewBase = pBase + uRa + 2;
-    const auto* pCalleePc =
-        static_cast<const BcIns_t*>(core::RefToPtr(pUni->ArenaBase(), pFn->m_rPc));
+    const auto* pCalleePc = reinterpret_cast<const BcIns_t*>(pFn->m_pPc);
     const BcIns_t insHeader{pCalleePc->uRaw};
     BcHandler_f fnHeader = pUni->Dispatch().Dynamic(insHeader.uRaw & 0xff);
     LJX_MUSTTAIL return fnHeader(pNewBase, pCalleePc + 1, insHeader.A(), uRd, pUni, pKBase);
@@ -272,10 +282,13 @@ LJX_H(FuncF) {
         RaiseError(*pUni, "stack overflow");
     const C_GcProto* pProto = C_GcProto::FromBytecode(
         reinterpret_cast<const std::uint32_t*>(pPc - 1));
-    // Clear missing params AND all temp slots (precise-GC contract: every live
-    // slot below the frame top is a valid TValue).
-    for (std::uint32_t uI = static_cast<std::uint32_t>(uRd); uI < uFrame; ++uI)
+    // Only MISSING PARAMETERS are cleared. Temp slots are left alone — the
+    // collector nils everything above the live top (see m_pHighWater), so the
+    // marker never sees a stale slot, and calls stop paying for the frame.
+    for (std::uint32_t uI = static_cast<std::uint32_t>(uRd), uP = pProto->ParamCount();
+         uI < uP; ++uI)
         pBase[uI] = TValue_t::Nil();
+    if (pBase + uFrame > pThread->m_pHighWater) pThread->m_pHighWater = pBase + uFrame;
     if (pUni->Gc().NeedsStep()) [[unlikely]] {
         pThread->m_pBase = pBase;
         pThread->m_pTop = pBase + uFrame;
@@ -367,7 +380,7 @@ LJX_H(Len) {
         const TValue_t tvB = pBase[uRd >> 8];                                   \
         const TValue_t tvC = pBase[uRd & 0xff];                                 \
         if (BothNumbers(tvB, tvC)) [[likely]] {                                 \
-            const double flA = tvB.AsDouble(), flB = tvC.AsDouble();            \
+            const double flA = LoadNum(tvB), flB = LoadNum(tvC);                \
             pBase[uRa] = TValue_t::Number(expr);                                \
         } else {                                                                \
             pBase[uRa] = ArithSlow(pUni, pBase, pPc, rt::EMetaMethod::mm, tvB, tvC); \
@@ -378,7 +391,7 @@ LJX_H(Len) {
         const TValue_t tvB = pBase[uRd >> 8];                                   \
         const TValue_t tvC = pKBase[uRd & 0xff];                                \
         if (tvB.IsDouble()) [[likely]] {                                        \
-            const double flA = tvB.AsDouble(), flB = tvC.AsDouble();            \
+            const double flA = LoadNum(tvB), flB = LoadNum(tvC);                \
             pBase[uRa] = TValue_t::Number(expr);                                \
         } else {                                                                \
             pBase[uRa] = ArithSlow(pUni, pBase, pPc, rt::EMetaMethod::mm, tvB, tvC); \
@@ -389,7 +402,7 @@ LJX_H(Len) {
         const TValue_t tvC = pBase[uRd >> 8];                                   \
         const TValue_t tvB = pKBase[uRd & 0xff];                                \
         if (tvC.IsDouble()) [[likely]] {                                        \
-            const double flA = tvB.AsDouble(), flB = tvC.AsDouble();            \
+            const double flA = LoadNum(tvB), flB = LoadNum(tvC);                \
             pBase[uRa] = TValue_t::Number(expr);                                \
         } else {                                                                \
             pBase[uRa] = ArithSlow(pUni, pBase, pPc, rt::EMetaMethod::mm, tvB, tvC); \
@@ -518,7 +531,7 @@ LJX_H(IsLt) {
     const TValue_t tvA = pBase[uRa], tvB = pBase[uRd];
     bool bTaken;
     if (BothNumbers(tvA, tvB)) [[likely]]
-        bTaken = tvA.AsDouble() < tvB.AsDouble();
+        bTaken = LoadNum(tvA) < LoadNum(tvB);
     else
         bTaken = CompareSlow(pUni, pBase, pPc, tvA, tvB, false);
     LJX_COMPARE_TAIL(bTaken);
@@ -527,7 +540,7 @@ LJX_H(IsGe) {
     const TValue_t tvA = pBase[uRa], tvB = pBase[uRd];
     bool bTaken;
     if (BothNumbers(tvA, tvB)) [[likely]]
-        bTaken = !(tvA.AsDouble() < tvB.AsDouble());  // NaN → taken
+        bTaken = !(LoadNum(tvA) < LoadNum(tvB));  // NaN → taken
     else
         bTaken = !CompareSlow(pUni, pBase, pPc, tvA, tvB, false);
     LJX_COMPARE_TAIL(bTaken);
@@ -536,7 +549,7 @@ LJX_H(IsLe) {
     const TValue_t tvA = pBase[uRa], tvB = pBase[uRd];
     bool bTaken;
     if (BothNumbers(tvA, tvB)) [[likely]]
-        bTaken = tvA.AsDouble() <= tvB.AsDouble();
+        bTaken = LoadNum(tvA) <= LoadNum(tvB);
     else
         bTaken = CompareSlow(pUni, pBase, pPc, tvA, tvB, true);
     LJX_COMPARE_TAIL(bTaken);
@@ -545,7 +558,7 @@ LJX_H(IsGt) {
     const TValue_t tvA = pBase[uRa], tvB = pBase[uRd];
     bool bTaken;
     if (BothNumbers(tvA, tvB)) [[likely]]
-        bTaken = !(tvA.AsDouble() <= tvB.AsDouble());  // NaN → taken
+        bTaken = !(LoadNum(tvA) <= LoadNum(tvB));  // NaN → taken
     else
         bTaken = !CompareSlow(pUni, pBase, pPc, tvA, tvB, true);
     LJX_COMPARE_TAIL(bTaken);
@@ -647,8 +660,7 @@ LJX_H(FNew) {
     pFn->m_Header.uExtra1 = 0;  // Lua closure
     pFn->m_Header.uExtra2 = static_cast<std::uint8_t>(uUpvals);
     pFn->m_rEnv = pUni->MakeRef(pUni->Globals());
-    pFn->m_rPc = core::PtrToRef(pUni->ArenaBase(), pProto->Bytecode());
-    pFn->m_uPad = 0;
+    pFn->m_pPc = pProto->Bytecode();
     C_GcFunction* pParent = FrameFunc(pBase);
     const auto* pDescs = static_cast<const std::uint16_t*>(
         core::RefToPtr(pUni->ArenaBase(), pProto->m_rUpvalDescs));
@@ -831,8 +843,7 @@ LJX_H(CallT) {
     if (!pBase[-2].Is(EValueTag::Function)) [[unlikely]]
         ErrorAtPc(pUni, pBase, pPc, "attempt to call a %s value", TypeName(pBase[-2]));
     auto* pFn = static_cast<C_GcFunction*>(pBase[-2].AsGcPointer());
-    const auto* pCalleePc =
-        static_cast<const BcIns_t*>(core::RefToPtr(pUni->ArenaBase(), pFn->m_rPc));
+    const auto* pCalleePc = reinterpret_cast<const BcIns_t*>(pFn->m_pPc);
     const BcIns_t insHeader{pCalleePc->uRaw};
     BcHandler_f fnHeader = pUni->Dispatch().Dynamic(insHeader.uRaw & 0xff);
     LJX_MUSTTAIL return fnHeader(pBase, pCalleePc + 1, insHeader.A(), uArgs, pUni, pKBase);
@@ -980,8 +991,7 @@ std::int32_t C_Interpreter::Call(C_LuaThread* pThread, TValue_t* pFunc, std::int
     if (!pFunc[0].Is(EValueTag::Function))
         RaiseError(*pUniverse, "attempt to call a %s value", TypeName(pFunc[0]));
     auto* pFn = static_cast<C_GcFunction*>(pFunc[0].AsGcPointer());
-    const auto* pCalleePc =
-        static_cast<const BcIns_t*>(core::RefToPtr(pUniverse->ArenaBase(), pFn->m_rPc));
+    const auto* pCalleePc = reinterpret_cast<const BcIns_t*>(pFn->m_pPc);
     const BcIns_t insHeader{pCalleePc->uRaw};
     BcHandler_f fnHeader = pUniverse->Dispatch().Dynamic(insHeader.uRaw & 0xff);
     pUniverse->m_uEntryResults = 0;

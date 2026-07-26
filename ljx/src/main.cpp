@@ -75,8 +75,7 @@ int main(int nArgc, char** vArgv) {
         pMain->m_Header.uExtra1 = 0;
         pMain->m_Header.uExtra2 = 0;
         pMain->m_rEnv = pUni->MakeRef(pUni->Globals());
-        pMain->m_rPc = core::PtrToRef(pUni->ArenaBase(), pProto->Bytecode());
-        pMain->m_uPad = 0;
+        pMain->m_pPc = pProto->Bytecode();
 
         vm::C_LuaThread* pThread = pUni->MainThread();
         vm::TValue_t* pFunc = pThread->m_pTop;

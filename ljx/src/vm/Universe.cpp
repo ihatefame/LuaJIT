@@ -75,6 +75,7 @@ C_Universe* C_Universe::Create(std::size_t uArenaReserveBytes) noexcept {
     pThread->m_pMaxStack = pStack + kMaxStackSlots;
     pThread->m_pBase = pStack + 2;   // room for a dummy frame [func][link]
     pThread->m_pTop = pThread->m_pBase;
+    pThread->m_pHighWater = pThread->m_pBase;
     pThread->m_rGlobal = core::PtrToRef(pUni->m_uArenaBase, pUni);
     pThread->m_pUniverse = pUni;
     pUni->m_pMainThread = pThread;

@@ -25,9 +25,11 @@ A complete, self-contained Lua front-end and runtime:
   parse-time constant folding, concat fusion, operand-kind `VN`/`NV`/`VV`
   variants).
 - **Interpreter** — a continuation-passing tail-call interpreter
-  (`[[clang::musttail]]` + `preserve_none`), one function per opcode,
-  replicated dispatch, FR2 two-slot frames on the value stack, errors via
-  setjmp/longjmp (see below).
+  (`[[clang::musttail]]`), one function per opcode, replicated dispatch, FR2
+  two-slot frames on the value stack, errors via setjmp/longjmp (see below).
+  Call frames do not clear their temp slots; the collector clears everything
+  above the live top instead, so that cost is paid once per GC rather than on
+  every call.
 - **Language** — locals/upvalues/globals, `if`/`while`/`repeat`/numeric &
   generic `for`, functions/closures/recursion/method calls, multiple returns
   and tailcalls, `and`/`or` short-circuit, metatables (`__index`,
@@ -124,11 +126,11 @@ Best-of-7, this machine, against the LuaJIT 2.1 built in `../src`:
 
 | bench | LJX (+loop JIT) | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
 |-------|----------------:|---------------:|-----------:|-------------:|-----------:|
-| tab   | **0.025s** | 0.068s | **2.72× faster** | 0.032s | **0.77× — faster** |
-| array | **0.0095s** | 0.041s | **4.34× faster** | 0.0076s | 1.25× |
-| loop  | **0.075s** | 0.323s | **4.28× faster** | 0.062s | 1.22× |
-| str   | **0.133s** | 0.142s | **1.06× faster** | 0.065s | 2.05× |
-| fib   | 0.434s | 0.330s | 0.76× | 0.059s | 7.32× |
+| tab   | **0.024s** | 0.067s | **2.75× faster** | 0.033s | **0.74× — faster** |
+| array | **0.0093s** | 0.041s | **4.37× faster** | 0.0076s | 1.21× |
+| loop  | **0.074s** | 0.325s | **4.36× faster** | 0.061s | 1.21× |
+| str   | **0.130s** | 0.140s | **1.07× faster** | 0.064s | 2.03× |
+| fib   | 0.370s | 0.338s | 0.91× | 0.059s | 6.31× |
 
 Reading this honestly:
 
@@ -141,9 +143,20 @@ Reading this honestly:
 - **`str`** edges past the assembly interpreter thanks to an allocation-free
   concat path and a hand-rolled integer formatter.
 - **`fib`** is the honest gap: recursion means function calls, which compiled
-  code does not cover, so it runs purely interpreted — and there the musttail
-  CPS interpreter still sits ~31% behind hand-written assembly. Calls in
-  compiled code are the next increment.
+  code does not cover, so it runs purely interpreted. Three call-path changes
+  (skip clearing frame temps, a raw callee-PC pointer instead of a compressed
+  ref, and loading operands straight into the FP domain instead of
+  `bit_cast`ing the word the tag check already fetched) took it from 0.76× to
+  **0.91×** of hand-written assembly. Calls in compiled code are the next
+  increment.
+
+**A note on `preserve_none`.** The architecture calls for it, and the code is
+written to use it, but clang 18 does not implement the attribute — the macro
+expands to nothing here, so the numbers above are what the interpreter achieves
+on the plain SysV convention. Inspecting the emitted handlers shows clang is
+already doing the right thing (no prologue, a clean indirect tail jump, the
+metamethod path split out of line), so `preserve_none` is upside, not a
+prerequisite.
 
 ## Layout
 

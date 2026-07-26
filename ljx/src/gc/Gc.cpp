@@ -84,9 +84,7 @@ void C_GarbageCollector::TraverseGrays() noexcept {
                 if (auto* pEnv = uni.Deref<vm::C_GcTable>(pFn->m_rEnv))
                     MarkObject(&pEnv->m_Header);
                 if (pFn->IsLua()) {
-                    auto* pProto = vm::C_GcProto::FromBytecode(
-                        static_cast<const std::uint32_t*>(
-                            core::RefToPtr(uni.ArenaBase(), pFn->m_rPc)));
+                    auto* pProto = vm::C_GcProto::FromBytecode(pFn->m_pPc);
                     MarkObject(&const_cast<vm::C_GcProto*>(pProto)->m_Header);
                     for (std::uint8_t uI = 0; uI < pFn->UpvalCount(); ++uI) {
                         if (auto* pUv = uni.Deref<vm::C_GcUpvalue>(pFn->UpvalRefs()[uI]))
@@ -121,6 +119,13 @@ void C_GarbageCollector::TraverseGrays() noexcept {
                 auto* pThread = reinterpret_cast<vm::C_LuaThread*>(pHeader);
                 for (TValue_t* pSlot = pThread->m_pStack; pSlot < pThread->m_pTop; ++pSlot)
                     MarkValue(*pSlot);  // frame links classify as doubles → skipped
+                // Everything between the live top and the deepest frame ever
+                // reached is dead: clear it so a future frame can never expose
+                // a slot still holding a pointer this cycle just freed. This is
+                // what lets call frames skip clearing their temp slots.
+                for (TValue_t* pSlot = pThread->m_pTop; pSlot < pThread->m_pHighWater; ++pSlot)
+                    *pSlot = TValue_t::Nil();
+                pThread->m_pHighWater = pThread->m_pTop;
                 break;
             }
             case EGcObjectType::UserData: {

@@ -440,8 +440,7 @@ C_GcFunction* NewCFunction(C_Universe& uni, CFunction_f fnImpl) {
     pFn->m_Header.uExtra1 = 1;  // C closure
     pFn->m_Header.uExtra2 = 0;
     pFn->m_rEnv = uni.MakeRef(uni.Globals());
-    pFn->m_rPc = core::PtrToRef(uni.ArenaBase(), &uni.m_insCFuncHeader);
-    pFn->m_uPad = 0;
+    pFn->m_pPc = &uni.m_insCFuncHeader.uRaw;
     pFn->CFunc() = fnImpl;
     return pFn;
 }

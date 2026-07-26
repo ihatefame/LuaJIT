@@ -194,7 +194,7 @@ public:
 };
 
 // ---------------------------------------------------------------------------
-// C_GcFunction — closures. Every callable carries m_rPc: Lua closures point at
+// C_GcFunction — closures. Every callable carries m_pPc: Lua closures point at
 // their proto's bytecode; C closures at a shared one-instruction "call C"
 // bytecode; builtins at synthetic fast-function opcodes — the interpreter
 // calls EVERYTHING through one dispatch on the callee's first instruction.
@@ -208,8 +208,11 @@ public:
     GcHeader_t m_Header;        // uExtra1=ffid, uExtra2=nupvalues
     core::GcRef_t m_rEnv;       // offset-aliased with C_GcUserData
     core::GcRef_t m_rGcList;
-    core::MRef_t m_rPc;         // uniform call dispatch target
-    std::uint32_t m_uPad = 0;   // payload below is 8-aligned
+    // Uniform call dispatch target. A RAW pointer, not a compressed ref: the
+    // call path would otherwise pay an arena-base load, a shift and an add on
+    // every single call, and the field lands in padding that a compressed ref
+    // would waste anyway (the struct size is identical either way).
+    const std::uint32_t* m_pPc = nullptr;
     // Lua closure: GcRef_t upvalue pointers follow inline.
     // C closure:   CFunction_f + inline TValue_t upvalues follow.
 
@@ -276,6 +279,11 @@ public:
     TValue_t* m_pTop = nullptr;    // first free slot (not maintained in frames)
     TValue_t* m_pMaxStack = nullptr;
     TValue_t* m_pStack = nullptr;
+    // Deepest frame extent reached since the last collection. Call frames do
+    // NOT nil their temp slots (that cost shows up on every call); instead the
+    // collector clears everything between the live top and this mark, so a
+    // slot can never hand the marker a pointer that was already freed.
+    TValue_t* m_pHighWater = nullptr;
     core::GcRef_t m_rOpenUpvals;   // address-sorted open-upvalue list
     core::GcRef_t m_rEnv;
     void* m_pCFrame = nullptr;     // C frame chain; low bits = resume/unwind flags
@@ -298,7 +306,7 @@ static_assert(core::IsFrozenLayout<C_GcProto> && sizeof(C_GcProto) == 48);
 static_assert(core::IsFrozenLayout<C_GcFunction> && sizeof(C_GcFunction) == 24);
 static_assert(core::IsFrozenLayout<C_GcUpvalue> && sizeof(C_GcUpvalue) == 24);
 static_assert(core::IsFrozenLayout<C_GcUserData> && sizeof(C_GcUserData) == 24);
-static_assert(core::IsFrozenLayout<C_LuaThread> && sizeof(C_LuaThread) == 80);
+static_assert(core::IsFrozenLayout<C_LuaThread> && sizeof(C_LuaThread) == 88);
 
 // ---- EGcObjectType ↔ EValueTag lockstep ------------------------------------
 // The dense object-type enum mirrors the value-tag complement order (LuaJIT's

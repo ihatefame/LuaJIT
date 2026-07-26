@@ -5,6 +5,11 @@
 // (ARCHITECTURE.md §7.1). Instructions of the same opcode are chained through
 // `rPrev`, which is what makes CSE, load forwarding and guard elimination cost
 // a short bounded walk instead of a hash lookup.
+//
+// The IR is deliberately *below* Lua semantics: by the time a bytecode has
+// been recorded, all its type dispatch has become guards and all its address
+// arithmetic has become explicit pointer ops. The backend therefore never
+// needs to know what a table is.
 #pragma once
 
 #include <cstdint>
@@ -20,30 +25,43 @@ inline constexpr IrRef kIrNone = 0;
 
 [[nodiscard]] constexpr bool IsConstRef(IrRef r) noexcept { return r < kIrBias; }
 
-// Types a trace specializes on. Anything not listed aborts recording.
+// Types a trace specializes on. The first seven mirror Lua types; `Int` and
+// `Ptr` are untagged machine values that only exist inside a trace.
 enum class EIrType : std::uint8_t {
-    Nil, False, True, Num, Str, Tab, Func, Ptr, Nothing,
+    Nil, False, True, Num, Str, Tab, Func, Int, Ptr, Nothing,
 };
 
-#define LJX_IR_OPS(X)                                                        \
-    /* constants and slot access */                                          \
-    X(KNum) X(KGc) X(KPri) X(KInt)                                           \
-    X(SLoad)          /* read a stack slot; carries the type guard        */ \
-    /* arithmetic (numbers, already guarded) */                              \
-    X(Add) X(Sub) X(Mul) X(Div) X(Mod) X(Neg)                                \
-    /* comparisons: guards that the recorded direction is taken */           \
-    X(Lt) X(Ge) X(Le) X(Gt) X(EqV) X(NeV)                                    \
-    /* object access */                                                      \
-    X(ARef)           /* &tab.array[i], after a bounds guard              */ \
-    X(HRefK)          /* &node for a constant key at its main position    */ \
-    X(ALoad) X(HLoad) X(AStore) X(HStore)                                    \
-    X(FLoadTabAsize) X(FLoadTabHmask) X(FLoadTabMeta) X(FLoadTabVersion)     \
-    /* guards */                                                             \
-    X(GuardType)      /* value has the recorded type                      */ \
-    X(GuardEq)        /* value equals a recorded constant                 */ \
-    X(GuardBound)     /* unsigned index < limit                           */ \
-    /* control */                                                            \
-    X(Phi) X(Loop) X(Nop)
+// Values of type Num live in an xmm register; everything else in a GPR.
+[[nodiscard]] constexpr bool IsFloatType(EIrType eType) noexcept {
+    return eType == EIrType::Num;
+}
+
+#define LJX_IR_OPS(X)                                                          \
+    X(Nop)                                                                     \
+    /* stack slots. SLoad is hoisted into the trace preamble and carries the */\
+    /* entry type guard; SStore is the write-through for slots the trace     */\
+    /* assigns but never reads (see TRACE_DESIGN.md §6).                     */\
+    X(SLoad) X(SStore)                                                         \
+    /* arithmetic on guarded numbers */                                        \
+    X(Add) X(Sub) X(Mul) X(Div) X(Mod) X(Neg)                                  \
+    X(ToInt)          /* double -> int64, guarded exact                     */ \
+    X(ToNum)          /* int64  -> double                                   */ \
+    /* guards: every one of these carries a snapshot (C_TraceJit::m_vInsSnap)*/ \
+    X(GuardLt) X(GuardGe) X(GuardLe) X(GuardGt)   /* ordered, non-NaN       */ \
+    X(GuardEq) X(GuardNe)        /* 64-bit raw word                         */ \
+    X(GuardEqI) X(GuardBelow)    /* 32-bit equal / unsigned below           */ \
+    /* address arithmetic */                                                   \
+    X(TabPtr)         /* tagged value  -> untagged 47-bit pointer           */ \
+    X(AddK)           /* ptr + constant byte offset                         */ \
+    X(IdxPtr)         /* ptr + index*8                                      */ \
+    X(RefPtr)         /* arena base + granule index*8 (GcRef_t/MRef_t)      */ \
+    /* memory */                                                               \
+    X(LoadTV)         /* tagged word at [ptr]; carries the type guard       */ \
+    X(StoreTV)                                                                 \
+    X(LoadU32)                                                                 \
+    X(IncU32)         /* ++*(uint32*)ptr — the table version bump           */ \
+    /* control */                                                              \
+    X(Loop)           /* the back edge                                      */
 
 enum class EIrOp : std::uint8_t {
 #define LJX_IR_ENUM(name) name,
@@ -54,20 +72,46 @@ enum class EIrOp : std::uint8_t {
 
 [[nodiscard]] const char* IrOpName(EIrOp eOp) noexcept;
 
+// True for operations that may be eliminated by CSE. Loads are included, and
+// their chains are truncated at every store, which is what makes load
+// forwarding safe without an alias analysis.
+[[nodiscard]] constexpr bool IsPureOp(EIrOp eOp) noexcept {
+    switch (eOp) {
+        case EIrOp::Nop:
+        case EIrOp::SLoad:
+        case EIrOp::SStore:
+        case EIrOp::StoreTV:
+        case EIrOp::Loop:
+            return false;
+        default:
+            return true;
+    }
+}
+
+[[nodiscard]] constexpr bool IsGuardOp(EIrOp eOp) noexcept {
+    switch (eOp) {
+        case EIrOp::GuardLt: case EIrOp::GuardGe: case EIrOp::GuardLe:
+        case EIrOp::GuardGt: case EIrOp::GuardEq: case EIrOp::GuardNe:
+        case EIrOp::GuardEqI: case EIrOp::GuardBelow:
+        case EIrOp::SLoad: case EIrOp::LoadTV: case EIrOp::ToInt:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct IrIns_t {
     IrRef rOp1 = 0;
     IrRef rOp2 = 0;
     EIrOp eOp{};
     EIrType eType{};
     IrRef rPrev = 0;      // previous instruction with the same opcode (CSE chain)
-
-    [[nodiscard]] constexpr std::uint32_t Operands() const noexcept {
-        return static_cast<std::uint32_t>(rOp1) | (static_cast<std::uint32_t>(rOp2) << 16);
-    }
 };
 static_assert(sizeof(IrIns_t) == 8, "IR instructions stay one 64-bit word");
 
 // A constant referenced by the trace: a raw 64-bit payload plus its type.
+// Num holds the double's bits, Str/Tab/Func the tagged word, Int/Ptr the raw
+// machine value.
 struct IrConst_t {
     std::uint64_t uValue = 0;
     EIrType eType{};
@@ -83,9 +127,9 @@ struct SnapSlot_t {
 struct Snapshot_t {
     std::uint32_t uFirstSlot = 0;   // index into the shared slot array
     std::uint32_t uSlotCount = 0;
-    std::uint32_t uResumePc = 0;    // bytecode index within the resume frame
+    std::uint32_t uResumeOfs = 0;   // bytecode index within the resume frame
     std::int32_t nBaseOffset = 0;   // frame base, relative to the entry base
-    std::uint32_t uExitLabel = 0;   // patched with the stub's code offset
+    const void* pResumePc = nullptr;   // absolute resume PC
 };
 
 }  // namespace ljx::jit

@@ -12,6 +12,7 @@
 #include "ljx/vm/Interpreter.hpp"
 #include "ljx/jit/FuncJit.hpp"
 #include "ljx/jit/LoopJit.hpp"
+#include "ljx/jit/TraceJit.hpp"
 #include "ljx/vm/Object.hpp"
 
 namespace ljx::vm {
@@ -92,6 +93,9 @@ C_Universe* C_Universe::Create(std::size_t uArenaReserveBytes) noexcept {
     auto* pFuncJit = new (pAlloc->AllocGcObject(sizeof(jit::C_FuncJit)))
         jit::C_FuncJit(*pUni);
     pUni->SetFuncJit(pFuncJit);
+    auto* pTraceJit = new (pAlloc->AllocGcObject(sizeof(jit::C_TraceJit)))
+        jit::C_TraceJit(*pUni);
+    pUni->SetTraceJit(pTraceJit);
     C_Interpreter::InitDispatchTables(pUni->m_Dispatch);
     return pUni;
 }

@@ -17,6 +17,7 @@
 #include "ljx/rt/StringInterner.hpp"
 #include "ljx/jit/FuncJit.hpp"
 #include "ljx/jit/LoopJit.hpp"
+#include "ljx/jit/TraceJit.hpp"
 #include "ljx/vm/Interpreter.hpp"
 
 namespace ljx::vm {
@@ -82,6 +83,9 @@ LJX_NOINLINE const char* TypeName(const TValue_t& tvValue) {
 
 // GC safe point: stack extent is well-defined here.
 LJX_NOINLINE void GcCheck(C_Universe* pUni, TValue_t* pBase) {
+    // A collection while the recorder is running could free an object the
+    // in-progress trace has already specialized on.
+    if (pUni->m_uRecording) return;
     C_LuaThread* pThread = pUni->MainThread();
     pThread->m_pBase = pBase;
     pThread->m_pTop = pBase + FrameProto(pUni, pBase)->FrameSize();
@@ -244,7 +248,11 @@ LJX_NOINLINE TValue_t IndexMissCached(C_Universe* pUni, TValue_t* pBase, const B
         const TValue_t tvResult = pSlot ? *pSlot : TValue_t::Nil();
         // Only a single-level __index table is cacheable: a deeper chain or a
         // function handler is re-resolved every time.
-        if (pCache && (!pSlot || !pSlot->IsNil() || pIndexTab->m_rMetatable.IsNull())) {
+        // Cache ONLY what this single level actually produced. `!pSlot` with a
+        // further metatable falls through to IndexSlow below, which walks the
+        // rest of the chain — caching nil here would make every later lookup
+        // of an inherited member return nil.
+        if (pCache && ((pSlot && !pSlot->IsNil()) || pIndexTab->m_rMetatable.IsNull())) {
             pCache->rMeta = pTab->m_rMetatable;
             pCache->uMetaVersion = pMeta->m_uVersion;
             pCache->rIndexTable = pUni->MakeRef(pIndexTab);
@@ -348,7 +356,7 @@ LJX_H(FuncF) {
     // run entirely as native code — recursion included — with no Lua frame and
     // no possibility of GC. The type check here IS the only guard the compiled
     // body needs, which is what makes call-heavy numeric code compilable.
-    if (pProto->m_pNative != reinterpret_cast<void*>(1) &&
+    if (pProto->m_pNative != reinterpret_cast<void*>(1) && !pUni->m_uRecording &&
         static_cast<std::uint32_t>(uRd) == pProto->ParamCount()) [[unlikely]] {
         bool bAllNumbers = true;
         for (std::uint32_t uI = 0; uI < uRd; ++uI)
@@ -392,7 +400,7 @@ LJX_H(FuncF) {
          uI < uP; ++uI)
         pBase[uI] = TValue_t::Nil();
     if (pBase + uFrame > pThread->m_pHighWater) pThread->m_pHighWater = pBase + uFrame;
-    if (pUni->Gc().NeedsStep()) [[unlikely]] {
+    if (pUni->Gc().NeedsStep() && !pUni->m_uRecording) [[unlikely]] {
         pThread->m_pBase = pBase;
         pThread->m_pTop = pBase + uFrame;
         pUni->Gc().CollectNow();
@@ -1018,7 +1026,7 @@ LJX_H(ForI) {
     // Hot counted loop → native code. On success it runs every iteration and
     // we resume past the loop; a failed entry guard (return 1) falls back to
     // the interpreter transparently.
-    if (jit::C_LoopJit* pJit = pUni->LoopJit()) [[likely]] {
+    if (jit::C_LoopJit* pJit = pUni->LoopJit(); pJit && !pUni->m_uRecording) [[likely]] {
         jit::CompiledLoop_f fnLoop =
             pJit->LookupOrTick(pPc - 1, static_cast<std::uint8_t>(uRa));
         if (fnLoop) {
@@ -1040,6 +1048,44 @@ LJX_H(ForI) {
     if (bExit) pPc += insSelf.JumpTarget();
     LJX_NEXT();
 }
+// Runs a compiled trace and reports where the interpreter picks up. The exit
+// stub has already written every live value back to the Lua stack, so the only
+// state to re-establish here is the frame base and the high-water mark that
+// the collector uses to bound its stack scan (a trace can write slots above
+// any frame the interpreter ever entered).
+struct TraceResume_t {
+    const BcIns_t* pPc;
+    TValue_t* pBase;
+};
+
+LJX_NOINLINE TraceResume_t RunTrace(const jit::Trace_t* pTrace, TValue_t* pBase,
+                                    C_Universe* pUni) {
+    auto fnTrace = reinterpret_cast<jit::TraceEntry_f>(pTrace->pCode);
+    const std::uint32_t uExit = fnTrace(pBase, pUni->ArenaBase());
+    if (jit::TraceDebug()) {
+        auto* pStats = const_cast<jit::Trace_t*>(pTrace);
+        ++pStats->uEntries;
+        if (pStats->vExitCounts.size() <= uExit) pStats->vExitCounts.resize(uExit + 1);
+        ++pStats->vExitCounts[uExit];
+        if (pStats->uEntries < 12)
+            std::fprintf(stderr, "[trace] #%u entry %llu -> exit %u\n", pTrace->uNumber,
+                         static_cast<unsigned long long>(pStats->uEntries), uExit);
+    }
+    C_LuaThread* pThread = pUni->MainThread();
+    TValue_t* pReach = pBase + pTrace->nTopSlot + 1;
+    if (pReach > pThread->m_pHighWater) pThread->m_pHighWater = pReach;
+    const jit::TraceExit_t& exit = pTrace->vExits[uExit];
+    return TraceResume_t{exit.pResumePc, pBase + exit.nBaseOffset};
+}
+
+// Turns a loop op into its J-variant once a trace exists for it, so the entry
+// test costs nothing on loops that were never compiled.
+LJX_FORCEINLINE void PatchLoopOp(const BcIns_t* pIns, EBcOp eJitVariant) noexcept {
+    auto* pMutable = const_cast<BcIns_t*>(pIns);
+    pMutable->uRaw = (pMutable->uRaw & ~std::uint32_t{0xff}) |
+                     static_cast<std::uint32_t>(eJitVariant);
+}
+
 LJX_H(ForL) {
     TValue_t* pSlots = pBase + uRa;
     const double flStep = pSlots[2].AsDouble();
@@ -1051,12 +1097,44 @@ LJX_H(ForL) {
         pSlots[3] = pSlots[0];
         const BcIns_t insSelf{pPc[-1].uRaw};
         pPc += insSelf.JumpTarget();
+        // Three instructions on the hot path: the counter only borrows once
+        // every kHotLoopThreshold iterations.
+        if (pUni->HotCounts().DecrementLoop(pPc) && pUni->TraceJit() &&
+            !pUni->m_uRecording) [[unlikely]] {
+            pUni->HotCounts().Reset(pPc, C_HotCountTable::kArmedValue);
+            const jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc, pBase, pKBase);
+            if (pTrace) {
+                PatchLoopOp(pPc - 1 - insSelf.JumpTarget(), EBcOp::JForL);
+                const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
+                pBase = res.pBase;
+                pPc = res.pPc;
+                pKBase = KBaseOf(pUni, FrameProto(pUni, pBase));
+            }
+        }
     }
     LJX_NEXT();
 }
 LJX_H(JForI) { LJX_MUSTTAIL return OpForI(LJX_PASS_ARGS); }
 LJX_H(IForL) { LJX_MUSTTAIL return OpForL(LJX_PASS_ARGS); }
-LJX_H(JForL) { LJX_MUSTTAIL return OpForL(LJX_PASS_ARGS); }
+LJX_H(JForL) {
+    TValue_t* pSlots = pBase + uRa;
+    const double flStep = pSlots[2].AsDouble();
+    const double flIdx = pSlots[0].AsDouble() + flStep;
+    const double flStop = pSlots[1].AsDouble();
+    pSlots[0] = TValue_t::Number(flIdx);
+    if (flStep >= 0 ? flIdx <= flStop : flIdx >= flStop) {
+        pSlots[3] = pSlots[0];
+        const BcIns_t insSelf{pPc[-1].uRaw};
+        pPc += insSelf.JumpTarget();
+        if (const jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc)) [[likely]] {
+            const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
+            pBase = res.pBase;
+            pPc = res.pPc;
+            pKBase = KBaseOf(pUni, FrameProto(pUni, pBase));
+        }
+    }
+    LJX_NEXT();
+}
 
 LJX_H(IterC) {
     // R[A]=R[A-3], R[A+2]=R[A-2], R[A+3]=R[A-1]; then call R[A] with 2 args.
@@ -1081,9 +1159,31 @@ LJX_H(IIterL) { LJX_MUSTTAIL return OpIterL(LJX_PASS_ARGS); }
 LJX_H(JIterL) { LJX_MUSTTAIL return OpIterL(LJX_PASS_ARGS); }
 LJX_H(IsNext) { ErrorAtPc(pUni, pBase, pPc, "IsNext not emitted%s", ""); }
 
-LJX_H(Loop) { LJX_NEXT(); }
+LJX_H(Loop) {
+    if (pUni->HotCounts().DecrementLoop(pPc) && pUni->TraceJit() &&
+        !pUni->m_uRecording) [[unlikely]] {
+        pUni->HotCounts().Reset(pPc, C_HotCountTable::kArmedValue);
+        const jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc - 1, pBase, pKBase);
+        if (pTrace) {
+            PatchLoopOp(pPc - 1, EBcOp::JLoop);
+            const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
+            pBase = res.pBase;
+            pPc = res.pPc;
+            pKBase = KBaseOf(pUni, FrameProto(pUni, pBase));
+        }
+    }
+    LJX_NEXT();
+}
 LJX_H(ILoop) { LJX_NEXT(); }
-LJX_H(JLoop) { LJX_NEXT(); }
+LJX_H(JLoop) {
+    if (const jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc - 1)) [[likely]] {
+        const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
+        pBase = res.pBase;
+        pPc = res.pPc;
+        pKBase = KBaseOf(pUni, FrameProto(pUni, pBase));
+    }
+    LJX_NEXT();
+}
 
 LJX_H(Jmp) {
     pPc += static_cast<std::int32_t>(uRd) - static_cast<std::int32_t>(kJumpBias);
@@ -1097,15 +1197,32 @@ LJX_H(JFuncF) { LJX_MUSTTAIL return OpFuncF(LJX_PASS_ARGS); }
 LJX_H(IFuncV) { LJX_MUSTTAIL return OpFuncV(LJX_PASS_ARGS); }
 LJX_H(JFuncV) { LJX_MUSTTAIL return OpFuncV(LJX_PASS_ARGS); }
 
+// Recording stub. Every dynamic entry points here while a trace is being
+// recorded: it observes the instruction WITH ITS LIVE OPERANDS — which is what
+// lets the recorder specialize on the types actually present — and then
+// re-dispatches through the static table.
+LJX_PRESERVE_NONE void RecordAndExecute(LJX_HANDLER_ARGS) {
+    pUni->TraceJit()->RecordInstruction(pPc - 1, pBase, pKBase);
+    BcHandler_f fnReal = pUni->Dispatch().Static(pPc[-1].uRaw & 0xff);
+    LJX_MUSTTAIL return fnReal(LJX_PASS_ARGS);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // Dispatch-table population & C++ entry points.
 // ---------------------------------------------------------------------------
 
-void C_DispatchTable::SetMode(EDispatchMode) noexcept {
+void C_DispatchTable::SetMode(EDispatchMode eMode) noexcept {
+    const bool bRecord = HasMode(eMode, EDispatchMode::Recording);
     for (std::uint32_t uI = 0; uI < kEntries; ++uI)
-        m_vDynamic[uI].store(m_vStatic[uI], std::memory_order_release);
+        m_vDynamic[uI].store(bRecord ? &RecordAndExecute : m_vStatic[uI],
+                             std::memory_order_release);
+}
+
+void C_Interpreter::SetRecordMode(C_Universe& uni, bool bOn) noexcept {
+    uni.m_uRecording = bOn ? 1u : 0u;
+    uni.Dispatch().SetMode(bOn ? EDispatchMode::Recording : EDispatchMode::Normal);
 }
 
 void C_Interpreter::InitDispatchTables(C_DispatchTable& dispatch) noexcept {
@@ -1120,6 +1237,10 @@ std::int32_t C_Interpreter::Call(C_LuaThread* pThread, TValue_t* pFunc, std::int
                                  std::int32_t nResults) {
     // Frame: [func][link][args…]; link marks the C entry.
     C_Universe* pUniverse = pThread->m_pUniverse;
+    // A nested interpreter run (a metamethod, a C function calling back) is
+    // not part of the trace being recorded — and its bytecodes would otherwise
+    // be appended to it with a bogus frame base.
+    if (pUniverse->m_uRecording) pUniverse->TraceJit()->AbortForReentry();
     TValue_t* pBase = pFunc + 2;
     (void)pBase;
     pFunc[1] = TValue_t{FrameLink_t::FromDelta(0, EFrameType::C).uRaw};

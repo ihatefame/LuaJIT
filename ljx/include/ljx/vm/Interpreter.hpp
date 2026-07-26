@@ -29,6 +29,8 @@ class C_GarbageCollector;
 namespace ljx::jit {
 class C_LoopJit;
 class C_FuncJit;
+class C_TraceJit;
+struct Trace_t;
 }
 
 namespace ljx::vm {
@@ -220,6 +222,8 @@ public:
     void SetLoopJit(jit::C_LoopJit* pJit) noexcept { m_pLoopJit = pJit; }
     [[nodiscard]] jit::C_FuncJit* FuncJit() noexcept { return m_pFuncJit; }
     void SetFuncJit(jit::C_FuncJit* pJit) noexcept { m_pFuncJit = pJit; }
+    [[nodiscard]] jit::C_TraceJit* TraceJit() noexcept { return m_pTraceJit; }
+    void SetTraceJit(jit::C_TraceJit* pJit) noexcept { m_pTraceJit = pJit; }
 
     // Compressed-ref decompression against this universe's arena.
     template <typename TObj>
@@ -283,6 +287,13 @@ public:
     TValue_t m_tvErrorValue;               // error object across the longjmp
     jit::C_LoopJit* m_pLoopJit = nullptr;  // counted-loop native compiler
     jit::C_FuncJit* m_pFuncJit = nullptr;  // whole-function native compiler
+    jit::C_TraceJit* m_pTraceJit = nullptr;   // trace compiler
+    // Non-zero while the trace recorder is observing the instruction stream.
+    // The two pattern-matching tiers and the collector step aside for it: a
+    // tier that runs a whole loop or function natively would hide those
+    // bytecodes from the recorder, and a collection could move the objects it
+    // is specializing on.
+    std::uint32_t m_uRecording = 0;
 };
 static_assert(std::is_standard_layout_v<C_Universe>,
               "offset-addressed from the pinned context register");
@@ -322,6 +333,11 @@ public:
 
     // Populates static + dynamic tables with the handler family.
     static void InitDispatchTables(C_DispatchTable& dispatch) noexcept;
+
+    // Routes every dispatch through the trace recorder (or back to the plain
+    // handlers). This is the architecture's instrumentation contract: the
+    // normal path never gains a per-instruction check.
+    static void SetRecordMode(C_Universe& uni, bool bOn) noexcept;
 };
 
 // Formats a message, interns it, parks it, longjmps to the protecting frame

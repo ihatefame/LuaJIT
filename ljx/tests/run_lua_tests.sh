@@ -30,6 +30,11 @@ check jit_func "$(printf '6765\n9\n42\tfalse\n101\nfalse\tstack overflow\n1\t2\t
 # JIT: zero-iteration loops, operand aliasing, unary minus, guard bail-out.
 check jit_edge "$(printf '0\n0\n-8\ntrue\n-10\n100\n0\nfalse')"
 check regress "$(printf '6765\n5050\n1024\n-2\n15\ntrue\nnested-ok\n42\n3\n120')"
+# Trace compiler: __index method dispatch, a per-instance override appearing
+# mid-loop, two-level inheritance, a mid-iteration type change, array and field
+# stores, inlined calls, descending loops and a break out of a traced loop.
+# Every line here is byte-identical to LuaJIT's own output.
+check trace "$(printf 'dot\t2200\noverride\tclass\tclass\tinstance\tinstance\ninherit\tbase\ndeopt\t450\narray\t98400\nfields\t301\t601\nmisc\t2406\nbreak\t201')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
 # script in tests/lua is run both ways and the outputs compared.

@@ -205,10 +205,13 @@ public:
         U8(static_cast<std::uint8_t>(0xF8 | (uGpr & 7)));
         U8(uBits);
     }
-    // cmp r32, imm32
+    // cmp r32, imm32   81 /7 id
+    // NOTE: the 0x3D short form is NOT usable here — it hardwires eax and
+    // ignores REX.B, so `cmp r8d, imm` would silently compare eax instead.
     void CmpR32Imm(std::uint8_t uGpr, std::uint32_t u) {
         if (uGpr >= 8) U8(0x41);
-        if ((uGpr & 7) == 0) { U8(0x3D); } else { U8(0x81); U8(static_cast<std::uint8_t>(0xF8 | (uGpr & 7))); }
+        U8(0x81);
+        U8(static_cast<std::uint8_t>(0xF8 | (uGpr & 7)));
         U32(u);
     }
 
@@ -291,6 +294,66 @@ public:
         std::memcpy(&m_vCode[uPatch], &nRel, 4);
     }
     [[nodiscard]] std::size_t Here() const noexcept { return m_vCode.size(); }
+
+    // ---- generic memory forms used by the trace backend ------------------
+    // mov r64Dst, [base+disp32]      REX.W 8B /r
+    void MovLoadR64(std::uint8_t uDst, std::uint8_t uBase, std::int32_t nDisp) {
+        RexRegRm(uDst, uBase, true);
+        U8(0x8B);
+        ModRmDisp(uDst, uBase, nDisp);
+    }
+    // mov [base+disp32], r64Src      REX.W 89 /r
+    void MovStoreR64(std::uint8_t uSrc, std::uint8_t uBase, std::int32_t nDisp) {
+        RexRegRm(uSrc, uBase, true);
+        U8(0x89);
+        ModRmDisp(uSrc, uBase, nDisp);
+    }
+    // mov r32Dst, [base+disp32]      8B /r  (zero-extends to 64)
+    void MovLoadR32Mem(std::uint8_t uDst, std::uint8_t uBase, std::int32_t nDisp) {
+        RexRegRm(uDst, uBase, false);
+        U8(0x8B);
+        ModRmDisp(uDst, uBase, nDisp);
+    }
+    // lea r64Dst, [base+disp32]      REX.W 8D /r
+    void LeaDisp(std::uint8_t uDst, std::uint8_t uBase, std::int32_t nDisp) {
+        RexRegRm(uDst, uBase, true);
+        U8(0x8D);
+        ModRmDisp(uDst, uBase, nDisp);
+    }
+    // lea r64Dst, [base + index*8]   REX.W 8D /r + SIB (disp8 = 0 form, which
+    // is also the encoding rbp/r13 require as a base).
+    void LeaIndexed8(std::uint8_t uDst, std::uint8_t uBase, std::uint8_t uIndex) {
+        U8(static_cast<std::uint8_t>(0x48 | ((uDst >= 8) ? 4 : 0) |
+                                     ((uIndex >= 8) ? 2 : 0) | ((uBase >= 8) ? 1 : 0)));
+        U8(0x8D);
+        U8(static_cast<std::uint8_t>(0x44 | ((uDst & 7) << 3)));            // mod=01, rm=SIB
+        U8(static_cast<std::uint8_t>(0xC0 | ((uIndex & 7) << 3) | (uBase & 7)));  // scale=8
+        U8(0);
+    }
+    // add dword [base+disp32], imm8  83 /0 ib
+    void AddMem32Imm8(std::uint8_t uBase, std::int32_t nDisp, std::int8_t nImm) {
+        RexRegRm(0, uBase, false);
+        U8(0x83);
+        ModRmDisp(0, uBase, nDisp);
+        U8(static_cast<std::uint8_t>(nImm));
+    }
+    // roundsd xmmDst, xmmSrc, imm8   66 [REX] 0F 3A 0B /r ib
+    void Roundsd(std::uint8_t uDst, std::uint8_t uSrc, std::uint8_t uMode) {
+        U8(0x66);
+        RexForXmmXmm(uDst, uSrc);
+        U8(0x0F); U8(0x3A); U8(0x0B);
+        U8(static_cast<std::uint8_t>(0xC0 | ((uDst & 7) << 3) | (uSrc & 7)));
+        U8(uMode);
+    }
+    // sub/add rsp, imm32
+    void SubRspImm32(std::uint32_t u) { U8(0x48); U8(0x81); U8(0xEC); U32(u); }
+    void AddRspImm32(std::uint32_t u) { U8(0x48); U8(0x81); U8(0xC4); U32(u); }
+    // mov r32Dst, imm32
+    void MovR32Imm(std::uint8_t uDst, std::uint32_t u) {
+        if (uDst >= 8) U8(0x41);
+        U8(static_cast<std::uint8_t>(0xB8 + (uDst & 7)));
+        U32(u);
+    }
 
     static constexpr std::uint8_t kRdiNum = 7;
 

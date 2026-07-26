@@ -70,10 +70,11 @@ only microseconds).
 
 What it does:
 
-1. **Scans** the bytecode from `FORI+1` to the matching `FORL`. Only
-   straight-line number arithmetic is accepted (`Add/Sub/Mul/Div` in all
-   `VV`/`VN`/`NV` forms, `Mov`, `Unm`, `KShort`, `KNum`); anything else — a
-   call, a branch, a table op — rejects the loop, permanently, for that site.
+1. **Scans** the bytecode from `FORI+1` to the matching `FORL`. Accepted:
+   straight-line number arithmetic (`Add/Sub/Mul/Div` in all `VV`/`VN`/`NV`
+   forms, `Mov`, `Unm`, `KShort`, `KNum`) and **array reads/writes indexed by
+   the loop variable** (`t[i]`, one table per loop). Anything else — a call, a
+   branch, an upvalue — rejects the loop permanently for that site.
 2. **Guards on entry**: the induction triple and every read-before-write input
    slot must hold doubles. Guards run before any state is touched, so a failed
    guard returns `1` and the interpreter runs the loop with no cleanup needed.
@@ -88,8 +89,34 @@ What it does:
    worth ~1.9× on the loop benchmark).
 5. **Specializes on step sign** at entry, emitting separate ascending and
    descending loops so the iteration test is a single `ucomisd` + `jae`.
+6. **Array access** keeps a parallel *integer* induction variable in a GP
+   register (so an index needs no per-iteration float→int conversion), hoists
+   the array pointer and length out of the loop, and checks the bound once per
+   iteration with a 64-bit unsigned compare — which catches negative indices
+   for free. Nothing inside compiled code can reallocate the array, so the
+   hoisted pointer stays valid.
+7. **Pre-grows** the array once at entry, through a runtime call emitted before
+   any value is cached in a register (so the VM state is wholly in memory and
+   the call is a safe point). Without this, a loop that fills a table from
+   empty would deoptimize on its very first store.
+8. **Deoptimizes mid-loop** when a bound or element-type guard fails: every
+   register-resident value and the induction variable are flushed back to the
+   stack and the *remaining* iterations run interpreted. The guard sits at the
+   top of the iteration, before any side effect, so the flushed state is
+   exactly an iteration boundary.
 
-`LJX_JITDEBUG=1` traces every compile decision (accepted, or why rejected).
+`LJX_JITDEBUG=1` traces every compile decision (accepted, or why rejected);
+`LJX_JITDUMP=<file>` writes the raw machine code for
+`objdump -D -b binary -m i386:x86-64 -M intel`; `LJX_NOJIT=1` forces the
+interpreter.
+
+**Correctness.** `make check` runs every script in `tests/lua` twice — once
+compiled, once with `LJX_NOJIT=1` — and requires byte-identical output. That
+differential test, plus a dedicated edge-case suite (zero-iteration loops in
+both directions, operand aliasing on non-commutative ops, unary minus,
+constant-on-the-left division, out-of-range and wrong-typed array elements,
+non-integral bounds, descending array walks), is what keeps the compiler
+honest.
 
 ## Benchmarks
 
@@ -97,22 +124,26 @@ Best-of-7, this machine, against the LuaJIT 2.1 built in `../src`:
 
 | bench | LJX (+loop JIT) | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
 |-------|----------------:|---------------:|-----------:|-------------:|-----------:|
-| loop  | **0.075s** | 0.323s | **4.28× faster** | 0.061s | 1.23× |
-| str   | **0.131s** | 0.142s | **1.08× faster** | 0.066s | 1.99× |
-| fib   | 0.415s | 0.325s | 0.78× | 0.058s | 7.20× |
-| tab   | 0.088s | 0.062s | 0.70× | 0.031s | 2.80× |
+| tab   | **0.025s** | 0.068s | **2.72× faster** | 0.032s | **0.77× — faster** |
+| array | **0.0095s** | 0.041s | **4.34× faster** | 0.0076s | 1.25× |
+| loop  | **0.075s** | 0.323s | **4.28× faster** | 0.062s | 1.22× |
+| str   | **0.133s** | 0.142s | **1.06× faster** | 0.065s | 2.05× |
+| fib   | 0.434s | 0.330s | 0.76× | 0.059s | 7.32× |
 
 Reading this honestly:
 
-- **`loop`** is what the JIT was built for: 4.3× faster than LuaJIT's
-  hand-written assembly interpreter and within **1.23×** of its full trace
-  compiler.
-- **`str`** now edges past the assembly interpreter thanks to an allocation-free
+- **`tab`** (fill a table, then sum it) is the one benchmark where LJX beats
+  LuaJIT's full trace compiler, and the reason is a strategy difference, not
+  raw codegen: pre-growing the array once at loop entry avoids the incremental
+  reallocation LuaJIT does as the table grows.
+- **`array`** and **`loop`** are 4.3× faster than LuaJIT's hand-written
+  assembly interpreter and land within **1.22–1.25×** of its trace compiler.
+- **`str`** edges past the assembly interpreter thanks to an allocation-free
   concat path and a hand-rolled integer formatter.
-- **`fib`** (recursion) and **`tab`** (table stores) have no JIT coverage yet —
-  they run purely interpreted, where the musttail CPS interpreter sits 22–43%
-  behind hand-written assembly. Function calls and table access in compiled
-  code are the next two increments.
+- **`fib`** is the honest gap: recursion means function calls, which compiled
+  code does not cover, so it runs purely interpreted — and there the musttail
+  CPS interpreter still sits ~31% behind hand-written assembly. Calls in
+  compiled code are the next increment.
 
 ## Layout
 

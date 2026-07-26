@@ -786,6 +786,9 @@ void Ctx_t::ParseSubExpr(ExpDesc_t& e, std::uint32_t uLimit) {
         }
         if (nKind == 3 || nKind == 4) {  // comparisons
             Exp2Val(e);
+            // Pin the left operand into a register before parsing the right
+            // one — see the note in the arithmetic case below.
+            if (!e.IsConstant()) Exp2AnyReg(e);
             ExpDesc_t e2;
             ParseSubExpr(e2, power.uRight);
             Exp2Val(e2);
@@ -827,6 +830,15 @@ void Ctx_t::ParseSubExpr(ExpDesc_t& e, std::uint32_t uLimit) {
         ExpDesc_t e2;
         if (nKind == 0) {
             Exp2Val(e);
+            // Materialize the left operand into a register BEFORE parsing the
+            // right one. A discharged-but-relocatable expression (UGet, GGet,
+            // TGet*, an arithmetic result) has emitted its instruction but
+            // holds NO register reservation, so anything the right-hand side
+            // allocates lands on the same slot and clobbers it — e.g.
+            // `c + w[i]` would emit UGet r4,c / UGet r4,w. Numeric constants
+            // are deliberately left unmaterialized so the NV operand-kind
+            // variant can still fold them into the instruction.
+            if (e.eKind != EExpKind::KNumber) Exp2AnyReg(e);
             ParseSubExpr(e2, power.uRight);
             Exp2Val(e2);
             // Parse-time folding (never to NaN or -0: constant-table hygiene).
@@ -874,6 +886,7 @@ void Ctx_t::ParseSubExpr(ExpDesc_t& e, std::uint32_t uLimit) {
             }
         } else {  // pow: both to registers
             Exp2Val(e);
+            if (!e.IsConstant()) Exp2AnyReg(e);
             ParseSubExpr(e2, power.uRight);
         }
         const std::uint8_t uRegB = Exp2AnyReg(e);

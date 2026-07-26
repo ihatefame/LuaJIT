@@ -170,6 +170,7 @@ LJX_NOINLINE void NewIndexSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_t*
             const TValue_t* pSlot = pTab->Get(*pUni, tvKey);
             if (pSlot && !pSlot->IsNil()) {  // existing key: raw store
                 *const_cast<TValue_t*>(pSlot) = tvValue;
+                pTab->BumpVersion();   // an inline cache may have resolved here
                 return;
             }
             auto* pMt = pUni->Deref<C_GcTable>(pTab->m_rMetatable);
@@ -195,6 +196,65 @@ LJX_NOINLINE void NewIndexSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_t*
         ErrorAtPc(pUni, pBase, pPc, "attempt to index a %s value", TypeName(tvTable));
     }
     ErrorAtPc(pUni, pBase, pPc, "'__newindex' chain too long%s", "");
+}
+
+// --- inline cache for metatable-resolved field lookups ----------------------
+//
+// `obj:method()` and `obj.field` on a class-style table both miss on the
+// receiver and resolve through its metatable's __index. That is two extra
+// table searches plus a metamethod lookup, on the hottest operation in
+// object-oriented Lua. The cache records what the chain produced, keyed on the
+// identity AND version of both tables involved, so a hit is four compares and
+// a stale entry can never be used.
+LJX_FORCEINLINE InlineCache_t* CacheLine(C_Universe* pUni, TValue_t* pBase,
+                                         const BcIns_t* pPc) noexcept {
+    const C_GcProto* pProto = FrameProto(pUni, pBase);
+    if (pProto->m_rInlineCache.IsNull()) return nullptr;
+    auto* pCaches = static_cast<InlineCache_t*>(
+        core::RefToPtr(pUni->ArenaBase(), pProto->m_rInlineCache));
+    const std::size_t uIdx = static_cast<std::size_t>(
+        pPc - 1 - reinterpret_cast<const BcIns_t*>(pProto->Bytecode()));
+    return uIdx < pProto->m_uBcCount ? &pCaches[uIdx] : nullptr;
+}
+
+// Returns true and fills tvOut when the cache is valid for this receiver.
+LJX_FORCEINLINE bool CacheProbe(C_Universe* pUni, const InlineCache_t* pCache,
+                                const C_GcTable* pTab, TValue_t& tvOut) noexcept {
+    if (!pCache || pCache->rMeta.IsNull() || pTab->m_rMetatable != pCache->rMeta)
+        return false;
+    const auto* pMeta = pUni->Deref<C_GcTable>(pCache->rMeta);
+    if (pMeta->m_uVersion != pCache->uMetaVersion) return false;
+    const auto* pIndexTab = pUni->Deref<C_GcTable>(pCache->rIndexTable);
+    if (!pIndexTab || pIndexTab->m_uVersion != pCache->uIndexVersion) return false;
+    tvOut = pCache->tvValue;
+    return true;
+}
+
+// Resolves obj[key] through the metatable and, when the chain is a plain
+// __index table, records it for next time.
+LJX_NOINLINE TValue_t IndexMissCached(C_Universe* pUni, TValue_t* pBase, const BcIns_t* pPc,
+                                      C_GcTable* pTab, const TValue_t& tvKey,
+                                      InlineCache_t* pCache) {
+    auto* pMeta = pUni->Deref<C_GcTable>(pTab->m_rMetatable);
+    const TValue_t* pIndex = pUni->Meta().Lookup(pMeta, rt::EMetaMethod::Index);
+    if (!pIndex) return TValue_t::Nil();
+    if (pIndex->Is(EValueTag::Table)) {
+        auto* pIndexTab = static_cast<C_GcTable*>(pIndex->AsGcPointer());
+        const TValue_t* pSlot = pIndexTab->Get(*pUni, tvKey);
+        const TValue_t tvResult = pSlot ? *pSlot : TValue_t::Nil();
+        // Only a single-level __index table is cacheable: a deeper chain or a
+        // function handler is re-resolved every time.
+        if (pCache && (!pSlot || !pSlot->IsNil() || pIndexTab->m_rMetatable.IsNull())) {
+            pCache->rMeta = pTab->m_rMetatable;
+            pCache->uMetaVersion = pMeta->m_uVersion;
+            pCache->rIndexTable = pUni->MakeRef(pIndexTab);
+            pCache->uIndexVersion = pIndexTab->m_uVersion;
+            pCache->tvValue = tvResult;
+        }
+        if (pSlot && !pSlot->IsNil()) return tvResult;
+        if (pIndexTab->m_rMetatable.IsNull()) return TValue_t::Nil();
+    }
+    return IndexSlow(pUni, pBase, pPc, TValue_t::GcObject(EValueTag::Table, pTab), tvKey);
 }
 
 // Arithmetic metamethod fallback.
@@ -809,6 +869,17 @@ LJX_H(TGetS) {
             pBase[uRa] = TValue_t::Nil();
             LJX_NEXT();
         }
+        // Missed on the receiver: this is the method-lookup shape, so try the
+        // inline cache before walking the metatable chain again.
+        InlineCache_t* pCache = CacheLine(pUni, pBase, pPc);
+        TValue_t tvCached;
+        if (CacheProbe(pUni, pCache, pTab, tvCached)) [[likely]] {
+            pBase[uRa] = tvCached;
+            LJX_NEXT();
+        }
+        pBase[uRa] = IndexMissCached(pUni, pBase, pPc, pTab,
+                                     TValue_t::GcObject(EValueTag::String, pKey), pCache);
+        LJX_NEXT();
     }
     pBase[uRa] =
         IndexSlow(pUni, pBase, pPc, tvTable, TValue_t::GcObject(EValueTag::String, pKey));
@@ -849,12 +920,33 @@ LJX_H(TSetV) {
     const TValue_t tvTable = pBase[uRd >> 8];
     const TValue_t tvKey = pBase[uRd & 0xff];
     if (ArrayStoreFast(pUni, tvTable, tvKey, pBase[uRa])) [[likely]] LJX_NEXT();
+    if (tvTable.Is(EValueTag::Table)) {
+        auto* pTab = static_cast<C_GcTable*>(tvTable.AsGcPointer());
+        const TValue_t* pSlot = pTab->Get(*pUni, tvKey);
+        if (pSlot && !pSlot->IsNil()) {          // existing key: raw store
+            *const_cast<TValue_t*>(pSlot) = pBase[uRa];
+            pTab->BumpVersion();
+            pUni->Gc().BarrierBackTable(pTab);
+            LJX_NEXT();
+        }
+    }
     NewIndexSlow(pUni, pBase, pPc, tvTable, tvKey, pBase[uRa]);
     LJX_NEXT();
 }
 LJX_H(TSetS) {
     const TValue_t tvTable = pBase[uRd >> 8];
     C_GcString* pKey = KgcString(pUni, pKBase, static_cast<std::uint32_t>(uRd & 0xff));
+    if (tvTable.Is(EValueTag::Table)) [[likely]] {
+        auto* pTab = static_cast<C_GcTable*>(tvTable.AsGcPointer());
+        // An existing key is a raw store: no metamethod can intercept it.
+        const TValue_t* pSlot = pTab->GetStr(*pUni, pKey);
+        if (pSlot && !pSlot->IsNil()) [[likely]] {
+            *const_cast<TValue_t*>(pSlot) = pBase[uRa];
+            pTab->BumpVersion();   // a cache may have resolved through this table
+            pUni->Gc().BarrierBackTable(pTab);
+            LJX_NEXT();
+        }
+    }
     NewIndexSlow(pUni, pBase, pPc, tvTable,
                  TValue_t::GcObject(EValueTag::String, pKey), pBase[uRa]);
     LJX_NEXT();

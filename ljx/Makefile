@@ -2,7 +2,7 @@
 CXX := clang++-18
 # -MMD -MP: regenerate objects when a header changes. Without this a layout
 # change silently leaves stale .o files linked against the old offsets.
-CXXFLAGS := -std=c++20 -O2 -g -Wall -Wextra -Iinclude -MMD -MP
+CXXFLAGS := -std=c++20 -O2 -g -Wall -Wextra -Iinclude -MMD -MP -flto
 
 SRC := $(wildcard src/core/*.cpp) $(wildcard src/rt/*.cpp) $(wildcard src/gc/*.cpp) \
        $(wildcard src/vm/*.cpp) $(wildcard src/fe/*.cpp) $(wildcard src/jit/*.cpp)

@@ -17,6 +17,13 @@ A complete, self-contained Lua front-end and runtime:
   hybrid array+hash tables with main-position chaining, Brent's eviction, and
   dead-key slot stability; closures with open/closed upvalues; protos as one
   colocated allocation with a split constant array.
+- **Inline caches** — every bytecode site carries a cache line, and every table
+  carries a version counter. A field lookup that misses on the receiver and
+  resolves through its metatable's `__index` — the shape of *every* method call
+  in object-oriented Lua — is recorded and replayed with four compares instead
+  of a metamethod lookup plus a second table search. Precise invalidation: any
+  binding change bumps the owning table's version, so a stale line can never be
+  used and nothing is ever globally flushed.
 - **GC** — precise mark-sweep from interpreter safe points (v1; the barrier
   call sites for the incremental/generational collector are already planted).
 - **Front end** — a single-pass, no-AST recursive-descent parser emitting
@@ -162,13 +169,14 @@ covered by tests that fail loudly without the fix:
 
 Best-of-7, this machine, against the LuaJIT 2.1 built in `../src`:
 
-| bench | LJX (JIT) | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
-|-------|----------:|---------------:|-----------:|-------------:|-----------:|
-| fib   | **0.062s** | 0.334s | **5.41× faster** | 0.059s | 1.04× |
-| tab   | **0.026s** | 0.069s | **2.62× faster** | 0.034s | **0.77× — faster** |
-| array | **0.0100s** | 0.040s | **4.04× faster** | 0.0079s | 1.27× |
-| loop  | **0.075s** | 0.324s | **4.30× faster** | 0.061s | 1.23× |
-| str   | **0.134s** | 0.143s | **1.06× faster** | 0.066s | 2.02× |
+| bench | LJX | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
+|-------|----:|---------------:|-----------:|-------------:|-----------:|
+| fib   | **0.061s** | 0.335s | **5.45× faster** | 0.063s | **0.98× — faster** |
+| loop  | **0.075s** | 0.327s | **4.39× faster** | 0.062s | 1.21× |
+| array | **0.0094s** | 0.041s | **4.35× faster** | 0.0073s | 1.28× |
+| tab   | **0.027s** | 0.069s | **2.58× faster** | 0.033s | **0.80× — faster** |
+| str   | **0.126s** | 0.142s | **1.13× faster** | 0.063s | 1.98× |
+| real  | 0.051s | 0.049s | 0.95× | 0.0029s | 17.7× |
 
 Reading this honestly:
 
@@ -185,6 +193,29 @@ Reading this honestly:
   Recursion is now real machine recursion.
 - **`str`** is the remaining soft spot: string building still allocates and
   interns per operation, which the JIT does not touch.
+
+### Where the JIT does *not* reach — and what that costs
+
+`real` is deliberately in the table: objects with methods, string-keyed
+dictionaries, nested tables. **Both JIT tiers reject every region in it** —
+the loop JIT because the bodies contain calls and string-keyed access, the
+function JIT because the functions touch tables. So `real` measures the
+interpreter alone, and against LuaJIT's trace compiler that is a **17.7× gap**.
+
+That number is the honest state of this project. The two tiers are pattern
+matchers: they are fast on the shapes they recognize and contribute nothing
+elsewhere. Closing it needs the tier `ARCHITECTURE.md` actually specifies — a
+trace compiler that records whatever executes, specializes on observed types,
+and side-exits on a guard failure — because that mechanism is indifferent to
+the *shape* of the code it compiles.
+
+What has been done for `real` so far is architectural rather than
+pattern-matched, and applies everywhere: link-time optimization (so runtime
+fast paths inline into interpreter handlers), inline caches for
+metatable-resolved lookups, and raw-store fast paths for table writes. Together
+they took it from 0.075s to 0.051s — from 1.55× *slower* than LuaJIT's assembly
+interpreter to 0.95× of it — without a line of code that knows what a benchmark
+looks like.
 
 Every benchmark result is checked against the interpreter (`LJX_NOJIT=1`) and
 must match exactly.

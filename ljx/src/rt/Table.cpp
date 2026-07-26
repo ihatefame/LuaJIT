@@ -138,6 +138,7 @@ const TValue_t* C_GcTable::Get(C_Universe& uni, const TValue_t& tvRawKey) const 
 // --- hash-part growth -------------------------------------------------------
 
 void C_GcTable::Resize(C_Universe& uni, std::uint32_t uNewArraySize, std::uint32_t uHashBits) {
+    BumpVersion();
     // Array growth: migrate hash entries with in-range integer keys.
     if (uNewArraySize > m_uArraySize) {
         auto* pNew =
@@ -189,6 +190,7 @@ void C_GcTable::Resize(C_Universe& uni, std::uint32_t uNewArraySize, std::uint32
 
 TValue_t* C_GcTable::Set(C_Universe& uni, const TValue_t& tvRawKey) {
     m_Header.uExtra1 = 0;  // any store invalidates the negative metamethod cache
+    BumpVersion();         // …and any inline cache that resolved through us
 
     const std::uint32_t uIndex = ArrayIndex(tvRawKey);
     if (uIndex < m_uArraySize) return &ArrayPart(uni, this)[uIndex];

@@ -21,6 +21,9 @@ check() {
 check hello "$(printf 'hello, world\n14\nconcat: 14!')"
 # JIT: array reads/writes, mid-loop deopt, guard fallback, descending walks.
 check jit_array "$(printf '15150\n42925\n1010\nfalse\t10\n18\n210')"
+# Inline caches: method reassignment, own-field shadowing, __index swap,
+# metatable removal, and two instances of one class.
+check ic_invalidate "$(printf 'A\tA\nB\nC\nB\nD\nnil\nbase/own')"
 # Function JIT: recursion, arity 2, non-number fallback, reassigned
 # self-reference, runaway recursion, NaN comparisons, constant-left division.
 check jit_func "$(printf '6765\n9\n42\tfalse\n101\nfalse\tstack overflow\n1\t2\t2\n-22')"

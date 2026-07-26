@@ -123,7 +123,10 @@ public:
     std::uint32_t m_uArraySize = 0;  // exclusive bound, 0-based
     std::uint32_t m_uHashMask = 0;   // size-1; 0 = shared nil-node
     core::MRef_t m_rFreeTop;
-    std::uint32_t m_uPad = 0;
+    // Bumped by every binding change. Inline caches record the version they
+    // were filled at, so a single compare invalidates them precisely — no
+    // global flush, no shape objects.
+    std::uint32_t m_uVersion = 0;
 
     // Creation: uArraySizeHint slots in the array part (0-based exclusive),
     // 1<<uHashBits hash nodes (0 = shared nil-node). Fresh tables start with
@@ -138,6 +141,9 @@ public:
     [[nodiscard]] const TValue_t* GetStr(C_Universe& uni, const C_GcString* pKey) const noexcept;
     void Resize(C_Universe& uni, std::uint32_t uArraySize, std::uint32_t uHashBits);
     [[nodiscard]] std::uint32_t Length(C_Universe& uni) const noexcept;  // nil-border search
+
+    // Any change to what a key maps to must go through this.
+    LJX_FORCEINLINE void BumpVersion() noexcept { ++m_uVersion; }
 };
 
 // ---------------------------------------------------------------------------
@@ -183,6 +189,8 @@ public:
     void* m_pNative = nullptr;
     std::uint32_t m_uJitCount = 0;
     std::uint32_t m_uPadJit = 0;
+    core::MRef_t m_rInlineCache;   // InlineCache_t[m_uBcCount]
+    std::uint32_t m_uPadIc = 0;
 
     [[nodiscard]] const std::uint32_t* Bytecode() const noexcept {
         return reinterpret_cast<const std::uint32_t*>(this + 1);
@@ -307,7 +315,20 @@ static_assert(offsetof(C_GcTable, m_rGcList) == offsetof(C_GcFunction, m_rGcList
 // ---- frozen sizes (traces/handlers bake these offsets in) ------------------
 static_assert(core::IsFrozenLayout<C_GcString> && sizeof(C_GcString) == 20);
 static_assert(core::IsFrozenLayout<C_GcTable> && sizeof(C_GcTable) == 40);
-static_assert(core::IsFrozenLayout<C_GcProto> && sizeof(C_GcProto) == 64);
+static_assert(core::IsFrozenLayout<C_GcProto> && sizeof(C_GcProto) == 72);
+
+// One cache line per bytecode site. Filled when a field lookup misses on the
+// receiver and resolves through its metatable's __index — the shape of every
+// method call. A hit costs two identity compares and two version compares,
+// replacing a metamethod lookup plus a second table search.
+struct InlineCache_t {
+    core::GcRef_t rMeta;          // receiver's metatable when filled
+    std::uint32_t uMetaVersion;
+    core::GcRef_t rIndexTable;    // the table __index resolved to
+    std::uint32_t uIndexVersion;
+    TValue_t tvValue;             // what the lookup produced
+};
+static_assert(core::IsFrozenLayout<InlineCache_t> && sizeof(InlineCache_t) == 24);
 static_assert(core::IsFrozenLayout<C_GcFunction> && sizeof(C_GcFunction) == 24);
 static_assert(core::IsFrozenLayout<C_GcUpvalue> && sizeof(C_GcUpvalue) == 24);
 static_assert(core::IsFrozenLayout<C_GcUserData> && sizeof(C_GcUserData) == 24);

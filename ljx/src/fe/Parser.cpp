@@ -1556,6 +1556,11 @@ C_GcProto* Ctx_t::FinishFunction() {
     pProto->m_pNative = nullptr;    // JIT state starts clean (raw GC memory)
     pProto->m_uJitCount = 0;
     pProto->m_uPadJit = 0;
+    pProto->m_uPadIc = 0;
+    auto* pCaches = static_cast<vm::InlineCache_t*>(
+        uni.Allocator().AllocVector(uBcCount * sizeof(vm::InlineCache_t)));
+    std::memset(pCaches, 0, uBcCount * sizeof(vm::InlineCache_t));
+    pProto->m_rInlineCache = core::PtrToRef(uni.ArenaBase(), pCaches);
     pProto->m_rChunkName = uni.MakeRef(lex.ChunkName());
     pProto->m_rGcList = core::GcRef_t{};
 

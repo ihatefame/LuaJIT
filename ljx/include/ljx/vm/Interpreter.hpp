@@ -28,6 +28,7 @@ class C_GarbageCollector;
 }
 namespace ljx::jit {
 class C_LoopJit;
+class C_FuncJit;
 }
 
 namespace ljx::vm {
@@ -217,6 +218,8 @@ public:
     [[nodiscard]] core::C_Prng& Prng() noexcept { return m_Prng; }
     [[nodiscard]] jit::C_LoopJit* LoopJit() noexcept { return m_pLoopJit; }
     void SetLoopJit(jit::C_LoopJit* pJit) noexcept { m_pLoopJit = pJit; }
+    [[nodiscard]] jit::C_FuncJit* FuncJit() noexcept { return m_pFuncJit; }
+    void SetFuncJit(jit::C_FuncJit* pJit) noexcept { m_pFuncJit = pJit; }
 
     // Compressed-ref decompression against this universe's arena.
     template <typename TObj>
@@ -279,6 +282,7 @@ public:
     ErrorFrame_t* m_pErrorTop = nullptr;   // current protected-call boundary
     TValue_t m_tvErrorValue;               // error object across the longjmp
     jit::C_LoopJit* m_pLoopJit = nullptr;  // counted-loop native compiler
+    jit::C_FuncJit* m_pFuncJit = nullptr;  // whole-function native compiler
 };
 static_assert(std::is_standard_layout_v<C_Universe>,
               "offset-addressed from the pinned context register");

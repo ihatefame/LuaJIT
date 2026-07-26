@@ -15,6 +15,7 @@
 #include "ljx/rt/Meta.hpp"
 #include "ljx/rt/StringBuffer.hpp"
 #include "ljx/rt/StringInterner.hpp"
+#include "ljx/jit/FuncJit.hpp"
 #include "ljx/jit/LoopJit.hpp"
 #include "ljx/vm/Interpreter.hpp"
 
@@ -280,8 +281,50 @@ LJX_H(FuncF) {
     C_LuaThread* pThread = pUni->MainThread();
     if (pBase + uFrame + kStackExtraSlots > pThread->m_pMaxStack) [[unlikely]]
         RaiseError(*pUni, "stack overflow");
-    const C_GcProto* pProto = C_GcProto::FromBytecode(
-        reinterpret_cast<const std::uint32_t*>(pPc - 1));
+    auto* pProto = const_cast<C_GcProto*>(C_GcProto::FromBytecode(
+        reinterpret_cast<const std::uint32_t*>(pPc - 1)));
+
+    // Whole-function JIT: a numeric-closed function with number arguments can
+    // run entirely as native code — recursion included — with no Lua frame and
+    // no possibility of GC. The type check here IS the only guard the compiled
+    // body needs, which is what makes call-heavy numeric code compilable.
+    if (pProto->m_pNative != reinterpret_cast<void*>(1) &&
+        static_cast<std::uint32_t>(uRd) == pProto->ParamCount()) [[unlikely]] {
+        bool bAllNumbers = true;
+        for (std::uint32_t uI = 0; uI < uRd; ++uI)
+            bAllNumbers &= pBase[uI].IsDouble();
+        if (bAllNumbers) {
+            const jit::CompiledFunc_t* pCompiled =
+                pUni->FuncJit()->LookupOrTick(pProto, FrameFunc(pBase));
+            if (pCompiled) {
+                double flResult;
+                switch (pCompiled->uArity) {
+                    case 1:
+                        flResult = reinterpret_cast<jit::NativeFn1_f>(pCompiled->pCode)(
+                            pBase[0].AsDouble());
+                        break;
+                    case 2:
+                        flResult = reinterpret_cast<jit::NativeFn2_f>(pCompiled->pCode)(
+                            pBase[0].AsDouble(), pBase[1].AsDouble());
+                        break;
+                    case 3:
+                        flResult = reinterpret_cast<jit::NativeFn3_f>(pCompiled->pCode)(
+                            pBase[0].AsDouble(), pBase[1].AsDouble(), pBase[2].AsDouble());
+                        break;
+                    default:
+                        flResult = reinterpret_cast<jit::NativeFn4_f>(pCompiled->pCode)(
+                            pBase[0].AsDouble(), pBase[1].AsDouble(), pBase[2].AsDouble(),
+                            pBase[3].AsDouble());
+                        break;
+                }
+                pBase[0] = TValue_t::Number(flResult);
+                uRa = 0;
+                uRd = 1;
+                LJX_MUSTTAIL return ReturnDispatch(LJX_PASS_ARGS);
+            }
+        }
+    }
+
     // Only MISSING PARAMETERS are cleared. Temp slots are left alone — the
     // collector nils everything above the live top (see m_pHighWater), so the
     // marker never sees a stale slot, and calls stop paying for the frame.

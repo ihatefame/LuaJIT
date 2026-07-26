@@ -34,6 +34,10 @@ A complete, self-contained Lua front-end and runtime:
   generic `for`, functions/closures/recursion/method calls, multiple returns
   and tailcalls, `and`/`or` short-circuit, metatables (`__index`,
   `__newindex`, `__add` … , `__eq`), `pcall`/`error`.
+- **Function JIT** (`jit/FuncJit.hpp`) — *numeric-closed* functions (numbers
+  in ⇒ numbers throughout: arithmetic, comparisons, branches, self-recursion)
+  compile to **native code with a plain `double f(double, …)` ABI**, so
+  recursion becomes a machine `call`. See "The function JIT" below.
 - **Loop JIT** (`jit/LoopJit.hpp`) — hot counted `for` loops whose bodies are
   straight-line number arithmetic are compiled to **x86-64 machine code**: entry
   type guards, all live slots promoted to xmm registers for the whole loop,
@@ -120,17 +124,51 @@ constant-on-the-left division, out-of-range and wrong-typed array elements,
 non-integral bounds, descending array walks), is what keeps the compiler
 honest.
 
+## The function JIT
+
+The loop JIT cannot help call-heavy code — there is no loop to compile. The
+function JIT closes that gap by exploiting one property:
+
+> A function is **numeric-closed** when every value it computes is a number
+> given number arguments.
+
+That single property buys two things the loop JIT has to work for:
+
+* **One guard, at the boundary.** Numbers in ⇒ numbers throughout, so the body
+  needs no guards at all and there is no mid-function deoptimization.
+* **No allocation ⇒ no GC.** Compiled frames therefore need no presence on the
+  Lua stack, so compiled code uses a plain native ABI — `double f(double, …)`
+  with arguments in `xmm0..`, slots pinned to `xmm8..xmm15`, and self-recursion
+  emitted as a machine `call`.
+
+Compilation happens on the 8th call. The type check the interpreter already
+performs at the call boundary *is* the guard; a non-number argument simply
+falls through to the interpreter.
+
+Two correctness obligations come with running on the native stack, and both are
+covered by tests that fail loudly without the fix:
+
+* **A reassigned self-reference.** Compiled code bakes in the closure it was
+  compiled against. If the upvalue holding it is reassigned, the compiled entry
+  must not be used — so it is re-validated once per outermost entry (nothing
+  inside compiled code can reassign an upvalue, so once is enough).
+* **Unbounded recursion.** Native recursion has no Lua-side depth check, so
+  every compiled entry tests `rsp` against a limit derived from `RLIMIT_STACK`
+  and raises a normal Lua `stack overflow` error instead of running off the C
+  stack. Abandoning the native frames via longjmp is safe precisely because
+  compiled functions hold no destructors and no VM state.
+
 ## Benchmarks
 
 Best-of-7, this machine, against the LuaJIT 2.1 built in `../src`:
 
-| bench | LJX (+loop JIT) | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
-|-------|----------------:|---------------:|-----------:|-------------:|-----------:|
-| tab   | **0.024s** | 0.067s | **2.75× faster** | 0.033s | **0.74× — faster** |
-| array | **0.0093s** | 0.041s | **4.37× faster** | 0.0076s | 1.21× |
-| loop  | **0.074s** | 0.325s | **4.36× faster** | 0.061s | 1.21× |
-| str   | **0.130s** | 0.140s | **1.07× faster** | 0.064s | 2.03× |
-| fib   | 0.370s | 0.338s | 0.91× | 0.059s | 6.31× |
+| bench | LJX (JIT) | LuaJIT `-joff` | vs. interp | LuaJIT (JIT) | vs. LJ JIT |
+|-------|----------:|---------------:|-----------:|-------------:|-----------:|
+| fib   | **0.062s** | 0.334s | **5.41× faster** | 0.059s | 1.04× |
+| tab   | **0.026s** | 0.069s | **2.62× faster** | 0.034s | **0.77× — faster** |
+| array | **0.0100s** | 0.040s | **4.04× faster** | 0.0079s | 1.27× |
+| loop  | **0.075s** | 0.324s | **4.30× faster** | 0.061s | 1.23× |
+| str   | **0.134s** | 0.143s | **1.06× faster** | 0.066s | 2.02× |
 
 Reading this honestly:
 
@@ -142,13 +180,14 @@ Reading this honestly:
   assembly interpreter and land within **1.22–1.25×** of its trace compiler.
 - **`str`** edges past the assembly interpreter thanks to an allocation-free
   concat path and a hand-rolled integer formatter.
-- **`fib`** is the honest gap: recursion means function calls, which compiled
-  code does not cover, so it runs purely interpreted. Three call-path changes
-  (skip clearing frame temps, a raw callee-PC pointer instead of a compressed
-  ref, and loading operands straight into the FP domain instead of
-  `bit_cast`ing the word the tag check already fetched) took it from 0.76× to
-  **0.91×** of hand-written assembly. Calls in compiled code are the next
-  increment.
+- **`fib`** went from 0.434s to **0.062s** once the function JIT landed — 5.4×
+  faster than LuaJIT's assembly interpreter and level with its trace compiler.
+  Recursion is now real machine recursion.
+- **`str`** is the remaining soft spot: string building still allocates and
+  interns per operation, which the JIT does not touch.
+
+Every benchmark result is checked against the interpreter (`LJX_NOJIT=1`) and
+must match exactly.
 
 **A note on `preserve_none`.** The architecture calls for it, and the code is
 written to use it, but clang 18 does not implement the attribute — the macro

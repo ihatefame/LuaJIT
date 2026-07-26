@@ -10,6 +10,7 @@
 #include "ljx/rt/Meta.hpp"
 #include "ljx/rt/StringInterner.hpp"
 #include "ljx/vm/Interpreter.hpp"
+#include "ljx/jit/FuncJit.hpp"
 #include "ljx/jit/LoopJit.hpp"
 #include "ljx/vm/Object.hpp"
 
@@ -88,6 +89,9 @@ C_Universe* C_Universe::Create(std::size_t uArenaReserveBytes) noexcept {
     auto* pLoopJit = new (pAlloc->AllocGcObject(sizeof(jit::C_LoopJit)))
         jit::C_LoopJit(*pUni);
     pUni->SetLoopJit(pLoopJit);
+    auto* pFuncJit = new (pAlloc->AllocGcObject(sizeof(jit::C_FuncJit)))
+        jit::C_FuncJit(*pUni);
+    pUni->SetFuncJit(pFuncJit);
     C_Interpreter::InitDispatchTables(pUni->m_Dispatch);
     return pUni;
 }

@@ -178,6 +178,11 @@ public:
     std::uint16_t m_uRootTrace = 0;   // root-trace chain anchor (16-bit id)
     core::GcRef_t m_rChunkName;       // interned chunk-name string
     core::MRef_t m_rLineInfo;         // BcLine_t[m_uBcCount] (debug; may be null)
+    // Whole-function JIT state: null = not tried, 1 = permanently rejected,
+    // otherwise a jit::CompiledFunc_t* valid for one specific closure.
+    void* m_pNative = nullptr;
+    std::uint32_t m_uJitCount = 0;
+    std::uint32_t m_uPadJit = 0;
 
     [[nodiscard]] const std::uint32_t* Bytecode() const noexcept {
         return reinterpret_cast<const std::uint32_t*>(this + 1);
@@ -302,7 +307,7 @@ static_assert(offsetof(C_GcTable, m_rGcList) == offsetof(C_GcFunction, m_rGcList
 // ---- frozen sizes (traces/handlers bake these offsets in) ------------------
 static_assert(core::IsFrozenLayout<C_GcString> && sizeof(C_GcString) == 20);
 static_assert(core::IsFrozenLayout<C_GcTable> && sizeof(C_GcTable) == 40);
-static_assert(core::IsFrozenLayout<C_GcProto> && sizeof(C_GcProto) == 48);
+static_assert(core::IsFrozenLayout<C_GcProto> && sizeof(C_GcProto) == 64);
 static_assert(core::IsFrozenLayout<C_GcFunction> && sizeof(C_GcFunction) == 24);
 static_assert(core::IsFrozenLayout<C_GcUpvalue> && sizeof(C_GcUpvalue) == 24);
 static_assert(core::IsFrozenLayout<C_GcUserData> && sizeof(C_GcUserData) == 24);

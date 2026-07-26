@@ -1553,6 +1553,9 @@ C_GcProto* Ctx_t::FinishFunction() {
     pProto->m_uUpvalCount = static_cast<std::uint8_t>(uUpvals);
     pProto->m_uFlags = 0;
     pProto->m_uRootTrace = 0;
+    pProto->m_pNative = nullptr;    // JIT state starts clean (raw GC memory)
+    pProto->m_uJitCount = 0;
+    pProto->m_uPadJit = 0;
     pProto->m_rChunkName = uni.MakeRef(lex.ChunkName());
     pProto->m_rGcList = core::GcRef_t{};
 

@@ -1,10 +1,13 @@
 # LJX build — clang is required for the musttail interpreter kernel.
 CXX := clang++-18
-CXXFLAGS := -std=c++20 -O2 -g -Wall -Wextra -Iinclude
+# -MMD -MP: regenerate objects when a header changes. Without this a layout
+# change silently leaves stale .o files linked against the old offsets.
+CXXFLAGS := -std=c++20 -O2 -g -Wall -Wextra -Iinclude -MMD -MP
 
 SRC := $(wildcard src/core/*.cpp) $(wildcard src/rt/*.cpp) $(wildcard src/gc/*.cpp) \
        $(wildcard src/vm/*.cpp) $(wildcard src/fe/*.cpp) $(wildcard src/jit/*.cpp)
 OBJ := $(patsubst src/%.cpp,build/%.o,$(SRC))
+DEP := $(OBJ:.o=.d) build/main.d build/test.d
 
 all: ljx ljx_test
 
@@ -32,5 +35,7 @@ check: ljx_test ljx
 
 clean:
 	rm -rf build ljx ljx_test
+
+-include $(DEP)
 
 .PHONY: all check clean

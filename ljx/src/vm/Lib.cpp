@@ -11,6 +11,7 @@
 #include <string>
 
 #include "ljx/gc/GarbageCollector.hpp"
+#include "ljx/vm/FastFunc.hpp"
 #include "ljx/rt/Meta.hpp"
 #include "ljx/rt/StringInterner.hpp"
 #include "ljx/vm/Interpreter.hpp"
@@ -434,10 +435,13 @@ std::int32_t LibCollectGarbage(lua_State* pState) {
 
 // --- registration -----------------------------------------------------------
 
-C_GcFunction* NewCFunction(C_Universe& uni, CFunction_f fnImpl) {
+C_GcFunction* NewCFunction(C_Universe& uni, CFunction_f fnImpl,
+                           EFastFunc eFfid = EFastFunc::C) {
     auto* pFn = static_cast<C_GcFunction*>(
         uni.Gc().AllocObject(EGcObjectType::Function, C_GcFunction::CAllocSize(0)));
-    pFn->m_Header.uExtra1 = 1;  // C closure
+    // The ffid is what lets the trace recorder recognize a builtin and emit
+    // its machine instruction instead of refusing the call.
+    pFn->m_Header.uExtra1 = static_cast<std::uint8_t>(eFfid);
     pFn->m_Header.uExtra2 = 0;
     pFn->m_rEnv = uni.MakeRef(uni.Globals());
     pFn->m_pPc = &uni.m_insCFuncHeader.uRaw;
@@ -450,9 +454,10 @@ void SetField(C_Universe& uni, C_GcTable* pTab, const char* sName, const TValue_
     *pTab->Set(uni, TValue_t::GcObject(EValueTag::String, pKey)) = tvValue;
 }
 
-void RegisterFn(C_Universe& uni, C_GcTable* pTab, const char* sName, CFunction_f fnImpl) {
+void RegisterFn(C_Universe& uni, C_GcTable* pTab, const char* sName, CFunction_f fnImpl,
+                EFastFunc eFfid = EFastFunc::C) {
     SetField(uni, pTab, sName,
-             TValue_t::GcObject(EValueTag::Function, NewCFunction(uni, fnImpl)));
+             TValue_t::GcObject(EValueTag::Function, NewCFunction(uni, fnImpl, eFfid)));
 }
 
 }  // namespace
@@ -481,14 +486,15 @@ void OpenStdLib(C_Universe& uni) {
         TValue_t::GcObject(EValueTag::Function, NewCFunction(uni, &LibNext));
     *uni.Registry()->Set(
         uni, TValue_t::GcObject(EValueTag::String, uni.Interner().Intern("ipairs_iter"))) =
-        TValue_t::GcObject(EValueTag::Function, NewCFunction(uni, &LibIPairsIter));
+        TValue_t::GcObject(EValueTag::Function,
+                           NewCFunction(uni, &LibIPairsIter, EFastFunc::IPairsAux));
 
     C_GcTable* pMath = C_GcTable::New(uni, 0, 4);
     SetField(uni, pGlobals, "math", TValue_t::GcObject(EValueTag::Table, pMath));
-    RegisterFn(uni, pMath, "floor", &LibMathFloor);
-    RegisterFn(uni, pMath, "ceil", &LibMathCeil);
-    RegisterFn(uni, pMath, "sqrt", &LibMathSqrt);
-    RegisterFn(uni, pMath, "abs", &LibMathAbs);
+    RegisterFn(uni, pMath, "floor", &LibMathFloor, EFastFunc::MathFloor);
+    RegisterFn(uni, pMath, "ceil", &LibMathCeil, EFastFunc::MathCeil);
+    RegisterFn(uni, pMath, "sqrt", &LibMathSqrt, EFastFunc::MathSqrt);
+    RegisterFn(uni, pMath, "abs", &LibMathAbs, EFastFunc::MathAbs);
     RegisterFn(uni, pMath, "sin", &LibMathSin);
     RegisterFn(uni, pMath, "cos", &LibMathCos);
     RegisterFn(uni, pMath, "exp", &LibMathExp);

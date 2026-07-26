@@ -14,6 +14,7 @@
 #include "ljx/gc/GarbageCollector.hpp"
 #include "ljx/jit/TraceJit.hpp"
 #include "ljx/rt/Meta.hpp"
+#include "ljx/vm/FastFunc.hpp"
 #include "ljx/vm/Frame.hpp"
 #include "ljx/vm/Interpreter.hpp"
 #include "ljx/vm/Object.hpp"
@@ -270,6 +271,7 @@ void C_TraceJit::StartRecording(const BcIns_t* pPc, TValue_t* pBase, const TValu
     m_pBase = pBase;
     m_pKBase = pKBase;
     m_uRecorded = 0;
+    m_bPendingCFunc = false;
     m_nBaseOffset = 0;
     m_nTopSlot = 0;
     m_vIns.clear();
@@ -519,6 +521,8 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
         case EBcOp::Loop: case EBcOp::ILoop: case EBcOp::JLoop:
         case EBcOp::FuncF: case EBcOp::IFuncF: case EBcOp::JFuncF:
             return true;
+        case EBcOp::FuncC: case EBcOp::FuncCW:
+            return SkipCFuncHeader();
 
         case EBcOp::ForL: case EBcOp::IForL: case EBcOp::JForL:
             return RecordForL(ins, pNext);
@@ -600,6 +604,37 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
             if (rVal == kIrNone) return false;
             m_vInsSnap[rVal - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pNext - 1));
             SetSlot(nB + uA, rVal);
+            return true;
+        }
+
+        case EBcOp::IterC: case EBcOp::IterN: {
+            const TValue_t tvIter = m_pBase[uA - 3];
+            if (!tvIter.Is(EValueTag::Function)) return false;
+            auto* pIter = static_cast<C_GcFunction*>(tvIter.AsGcPointer());
+            if (static_cast<vm::EFastFunc>(pIter->m_Header.uExtra1) !=
+                vm::EFastFunc::IPairsAux)
+                return false;
+            const IrRef rIter = SlotRef(nB + static_cast<std::int32_t>(uA) - 3);
+            if (rIter == kIrNone) return false;
+            if (!IsConstRef(rIter))
+                (void)EmitGuard(EIrOp::GuardEq, rIter, Materialize(Constant(tvIter)),
+                                pNext - 1);
+            if (m_eState != ETraceState::Recording) return false;
+            if (ins.B() != 3) return false;   // `for i, v in ipairs(t)` exactly
+            SetSlot(nB + static_cast<std::int32_t>(uA), rIter);
+            if (!RecordIPairsIter(ins, pNext - 1)) return false;
+            m_bPendingCFunc = true;
+            return true;
+        }
+        case EBcOp::IterL: case EBcOp::IIterL: case EBcOp::JIterL: {
+            // The control slot is non-nil on the recorded path — the iterator's
+            // own guards proved it — so the branch folds and only the copy of
+            // the control variable remains.
+            const IrRef rCtl = SlotRef(nB + static_cast<std::int32_t>(uA));
+            if (rCtl == kIrNone) return false;
+            const EIrType eCtl = TypeOf(rCtl);
+            if (eCtl == EIrType::Nil || eCtl == EIrType::Nothing) return false;
+            SetSlot(nB + static_cast<std::int32_t>(uA) - 1, rCtl);
             return true;
         }
 
@@ -987,6 +1022,91 @@ bool C_TraceJit::RecordTableSet(const BcIns_t& ins, const BcIns_t* pNext, TValue
 // trace spans many Lua frames and the call overhead disappears entirely.
 // ---------------------------------------------------------------------------
 
+// A C function is normally the end of a trace: it can allocate, it can call
+// back into the interpreter, and the recorder cannot see inside it. The
+// builtins below are the exceptions — pure, allocation-free, numbers in and
+// numbers out — and each one is a single SSE instruction, so the trace emits
+// the instruction instead of refusing the call.
+bool C_TraceJit::RecordBuiltin(vm::EFastFunc eFfid, const BcIns_t& ins, const BcIns_t* pNext) {
+    const std::int32_t nB = m_nBaseOffset;
+    const std::int32_t nArg = nB + static_cast<std::int32_t>(ins.A()) + 2;
+    const std::uint32_t uArgs = static_cast<std::uint32_t>(ins.C()) - 1u;
+    const std::uint32_t uWant = ins.B();          // nresults + 1; 0 = all
+    auto Unary = [&](EIrOp eOp, IrRef rMode) -> bool {
+        if (uArgs != 1 || uWant != 2) return false;   // exactly one result wanted
+        const IrRef rArg = SlotRef(nArg);
+        if (TypeOf(rArg) != EIrType::Num) return false;
+        const IrRef rRes = Emit(eOp, EIrType::Num, Materialize(rArg), rMode);
+        if (rRes == kIrNone) return false;
+        SetSlot(nB + static_cast<std::int32_t>(ins.A()), rRes);
+        return true;
+    };
+    switch (eFfid) {
+        case vm::EFastFunc::MathFloor: return Unary(EIrOp::Round, ConstantInt(0x09));
+        case vm::EFastFunc::MathCeil:  return Unary(EIrOp::Round, ConstantInt(0x0a));
+        case vm::EFastFunc::MathSqrt:  return Unary(EIrOp::Sqrt, kIrNone);
+        case vm::EFastFunc::MathAbs:   return Unary(EIrOp::Abs, kIrNone);
+        default: return false;
+    }
+    (void)pNext;
+}
+
+// The interpreter still dispatches the builtin's own FuncC header after the
+// call; the recorder has already emitted the instruction that replaces it, so
+// that header — and nothing else — is skipped.
+bool C_TraceJit::SkipCFuncHeader() {
+    if (!m_bPendingCFunc) return false;
+    m_bPendingCFunc = false;
+    return true;
+}
+
+// `for i, v in ipairs(t)` compiles to IterC (call the iterator) + IterL (the
+// back edge). The iterator is a C function whose whole body is "bump the
+// index, read the array slot, stop on nil" — recorded here as the array access
+// it is, with the bound guard doubling as the loop-exit guard.
+bool C_TraceJit::RecordIPairsIter(const BcIns_t& ins, const BcIns_t* pPc) {
+    const std::int32_t nB = m_nBaseOffset;
+    const std::int32_t nA = nB + static_cast<std::int32_t>(ins.A());
+    const IrRef rTab = SlotRef(nA - 2);
+    const IrRef rIdx = SlotRef(nA - 1);
+    if (TypeOf(rTab) != EIrType::Tab || TypeOf(rIdx) != EIrType::Num) return false;
+    auto* pTab = static_cast<C_GcTable*>(m_pEntryBase[nA - 2].AsGcPointer());
+    const double flNext = m_pEntryBase[nA - 1].AsDouble() + 1.0;
+    const auto nNext = static_cast<std::int64_t>(flNext);
+    if (static_cast<double>(nNext) != flNext) return false;
+    if (static_cast<std::uint64_t>(nNext) >= pTab->m_uArraySize) return false;
+
+    const IrRef rNext = Emit(EIrOp::Add, EIrType::Num, rIdx, Materialize(ConstantNum(1.0)));
+    const IrRef rInt = Emit(EIrOp::ToInt, EIrType::Int, rNext, kIrNone);
+    if (rInt == kIrNone) return false;
+    m_vInsSnap[rInt - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pPc));
+    const IrRef rTabPtr = Emit(EIrOp::TabPtr, EIrType::Ptr, rTab, kIrNone);
+    const IrRef rSize = Emit(EIrOp::LoadU32, EIrType::Int,
+                             Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr, ConstantInt(kOfsTabAsize)),
+                             kIrNone);
+    // Falling off the end of the array part is the loop's exit: the guard
+    // resumes the interpreter at this very IterC, which runs the real iterator.
+    (void)EmitGuard(EIrOp::GuardBelow, rInt, rSize, pPc);
+    const IrRef rArr = Emit(EIrOp::RefPtr, EIrType::Ptr,
+                            Emit(EIrOp::LoadU32, EIrType::Int,
+                                 Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
+                                      ConstantInt(kOfsTabArray)),
+                                 kIrNone),
+                            kIrNone);
+    const TValue_t* pElem =
+        static_cast<TValue_t*>(core::RefToPtr(m_pUniverse->ArenaBase(), pTab->m_rArray)) + nNext;
+    const EIrType eType = ObservedType(*pElem);
+    // A nil element also ends the iteration; the type guard is what catches it.
+    if (eType == EIrType::Nothing || eType == EIrType::Nil) return false;
+    const IrRef rElem = Emit(EIrOp::LoadTV, eType,
+                             Emit(EIrOp::IdxPtr, EIrType::Ptr, rArr, rInt), kIrNone);
+    if (rElem == kIrNone) return false;
+    m_vInsSnap[rElem - kIrBias] = static_cast<std::uint16_t>(TakeSnapshot(pPc));
+    SetSlot(nA, rNext);
+    SetSlot(nA + 1, rElem);
+    return m_eState == ETraceState::Recording;
+}
+
 bool C_TraceJit::RecordCall(const BcIns_t& ins, const BcIns_t* pNext) {
     if (m_vFrames.size() >= kMaxInlineDepth) return false;
     const std::int32_t nB = m_nBaseOffset;
@@ -995,7 +1115,18 @@ bool C_TraceJit::RecordCall(const BcIns_t& ins, const BcIns_t* pNext) {
     const TValue_t tvFunc = m_pBase[uA];
     if (!tvFunc.Is(EValueTag::Function)) return false;
     auto* pFn = static_cast<C_GcFunction*>(tvFunc.AsGcPointer());
-    if (!pFn->IsLua()) return false;   // C functions can allocate and re-enter
+    if (!pFn->IsLua()) {
+        const auto eFfid = static_cast<vm::EFastFunc>(pFn->m_Header.uExtra1);
+        if (eFfid == vm::EFastFunc::C) return false;
+        const IrRef rFn = SlotRef(nB + static_cast<std::int32_t>(uA));
+        if (rFn == kIrNone) return false;
+        if (!IsConstRef(rFn))
+            (void)EmitGuard(EIrOp::GuardEq, rFn, Materialize(Constant(tvFunc)), pNext - 1);
+        if (m_eState != ETraceState::Recording) return false;
+        if (!RecordBuiltin(eFfid, ins, pNext)) return false;
+        m_bPendingCFunc = true;
+        return true;
+    }
     const auto* pProto = C_GcProto::FromBytecode(pFn->m_pPc);
     if (pProto->m_uFlags & static_cast<std::uint8_t>(vm::EProtoFlag::IsVararg)) return false;
     if (uArgs != pProto->ParamCount()) return false;

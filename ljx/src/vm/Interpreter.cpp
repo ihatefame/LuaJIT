@@ -1156,11 +1156,37 @@ LJX_H(IterL) {
         pSlots[-1] = pSlots[0];  // update control variable
         const BcIns_t insSelf{pPc[-1].uRaw};
         pPc += insSelf.JumpTarget();
+        if (pUni->HotCounts().DecrementLoop(pPc) && pUni->TraceJit() &&
+            !pUni->m_uRecording) [[unlikely]] {
+            pUni->HotCounts().Reset(pPc, C_HotCountTable::kArmedValue);
+            const jit::Trace_t* pTrace = pUni->TraceJit()->OnLoopEdge(pPc, pBase, pKBase);
+            if (pTrace) {
+                PatchLoopOp(pPc - 1 - insSelf.JumpTarget(), EBcOp::JIterL);
+                const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
+                pBase = res.pBase;
+                pPc = res.pPc;
+                pKBase = KBaseOf(pUni, FrameProto(pUni, pBase));
+            }
+        }
     }
     LJX_NEXT();
 }
 LJX_H(IIterL) { LJX_MUSTTAIL return OpIterL(LJX_PASS_ARGS); }
-LJX_H(JIterL) { LJX_MUSTTAIL return OpIterL(LJX_PASS_ARGS); }
+LJX_H(JIterL) {
+    TValue_t* pSlots = pBase + uRa;
+    if (!pSlots[0].IsNil()) {
+        pSlots[-1] = pSlots[0];
+        const BcIns_t insSelf{pPc[-1].uRaw};
+        pPc += insSelf.JumpTarget();
+        if (const jit::Trace_t* pTrace = pUni->TraceJit()->TraceAt(pPc)) [[likely]] {
+            const TraceResume_t res = RunTrace(pTrace, pBase, pUni);
+            pBase = res.pBase;
+            pPc = res.pPc;
+            pKBase = KBaseOf(pUni, FrameProto(pUni, pBase));
+        }
+    }
+    LJX_NEXT();
+}
 LJX_H(IsNext) { ErrorAtPc(pUni, pBase, pPc, "IsNext not emitted%s", ""); }
 
 LJX_H(Loop) {

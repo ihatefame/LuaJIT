@@ -23,3 +23,28 @@ function L:bump() self.n = self.n + 1 return self.n end
 local last = 0
 for i = 1, 500 do last = obj:bump() end
 print(obj.n, last)
+
+-- ipairs iteration: the iterator is a builtin whose whole body is "bump the
+-- index, read the array slot, stop on nil", recorded as the array access it is.
+local arr = {}
+for i = 1, 400 do arr[i] = i * 3 end
+local s1, s2 = 0, 0
+for i, v in ipairs(arr) do s1 = s1 + i; s2 = s2 + v end
+print(s1, s2)
+
+-- math builtins that are one SSE instruction each
+local f, c, q, a = 0, 0, 0, 0
+for i = 1, 400 do
+  f = f + math.floor(i / 7)
+  c = c + math.ceil(i / 7)
+  q = q + math.sqrt(i)
+  a = a + math.abs(200 - i)
+end
+print(f, c, math.floor(q * 10000), a)
+
+-- an ipairs loop that stops early because of a nil hole
+local holed = {1, 2, 3}
+holed[5] = 5
+local n = 0
+for _, v in ipairs(holed) do n = n + v end
+print(n)

@@ -16,6 +16,7 @@
 #include "ljx/vm/Value.hpp"
 
 namespace ljx::vm {
+enum class EFastFunc : std::uint16_t;
 class C_Universe;
 class C_GcProto;
 class C_GcTable;
@@ -125,6 +126,10 @@ private:
                                       vm::TValue_t tvKey, std::int32_t nTabSlot);
     [[nodiscard]] bool RecordForL(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
     [[nodiscard]] bool RecordCall(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
+    [[nodiscard]] bool RecordBuiltin(vm::EFastFunc eFfid, const vm::BcIns_t& ins,
+                                     const vm::BcIns_t* pPc);
+    [[nodiscard]] bool RecordIPairsIter(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
+    [[nodiscard]] bool SkipCFuncHeader();
     [[nodiscard]] bool RecordReturn(const vm::BcIns_t& ins, std::uint32_t uFirst,
                                     std::uint32_t uCount);
 
@@ -148,6 +153,7 @@ private:
     vm::TValue_t* m_pBase = nullptr;                // current frame while recording
     const vm::TValue_t* m_pKBase = nullptr;         // current frame's constants
     std::uint32_t m_uRecorded = 0;
+    bool m_bPendingCFunc = false;   // a builtin was inlined; skip its FuncC header
     std::int32_t m_nBaseOffset = 0;                 // current frame, vs entry base
     std::int32_t m_nTopSlot = 0;
     std::vector<IrIns_t> m_vIns;                    // instructions (index + kIrBias = ref)

@@ -46,6 +46,8 @@ enum class EIrType : std::uint8_t {
                       /* rematerializes it                                    */ \
     /* arithmetic on guarded numbers */                                        \
     X(Add) X(Sub) X(Mul) X(Div) X(Mod) X(Neg)                                  \
+    X(Round)          /* roundsd; rOp2 = mode constant (floor / ceil)      */ \
+    X(Sqrt) X(Abs)                                                             \
     X(ToInt)          /* double -> int64, guarded exact                     */ \
     X(ToNum)          /* int64  -> double                                   */ \
     /* guards: every one of these carries a snapshot (C_TraceJit::m_vInsSnap)*/ \

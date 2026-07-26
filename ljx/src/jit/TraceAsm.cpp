@@ -545,6 +545,29 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             return true;
         }
 
+        case EIrOp::Round: {
+            const std::uint8_t uA = OperandXmm(ins.rOp1, 0);
+            if (!Allocate(uIdx, true, uDst)) return false;
+            m_Emit.Roundsd(uDst, uA, static_cast<std::uint8_t>(ConstOf(ins.rOp2)));
+            return true;
+        }
+
+        case EIrOp::Sqrt: {
+            const std::uint8_t uA = OperandXmm(ins.rOp1, 0);
+            if (!Allocate(uIdx, true, uDst)) return false;
+            m_Emit.Sqrtsd(uDst, uA);
+            return true;
+        }
+
+        case EIrOp::Abs: {
+            const std::uint8_t uA = OperandXmm(ins.rOp1, 0);
+            MaterializeConstXmm(kXmmTemp, ~(std::uint64_t{1} << 63));
+            if (!Allocate(uIdx, true, uDst)) return false;
+            m_Emit.MovsdRegReg(uDst, uA);
+            m_Emit.Andpd(uDst, kXmmTemp);
+            return true;
+        }
+
         case EIrOp::Neg: {
             const std::uint8_t uA = OperandXmm(ins.rOp1, 0);
             MaterializeConstXmm(kXmmTemp, std::uint64_t{1} << 63);

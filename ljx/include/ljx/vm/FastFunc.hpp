@@ -23,7 +23,8 @@ namespace ljx::vm {
 // Illustrative id registry: full set mirrors LuaJIT's ~57 asm fast functions.
 // X(name) — order is frozen once shipped (ids are baked into dispatch).
 #define LJX_FASTFUNC_REGISTRY(X)                                    \
-    X(Assert) X(Type) X(Next) X(Pairs) X(IPairs) X(GetMetatable)    \
+    X(Assert) X(Type) X(Next) X(Pairs) X(IPairs) X(IPairsAux)        \
+    X(GetMetatable)                                                 \
     X(ToNumber) X(ToString) X(RawGet) X(RawEqual) X(PCall) X(XPCall)\
     X(Select) X(Unpack)                                             \
     X(MathAbs) X(MathFloor) X(MathCeil) X(MathSqrt) X(MathMin)      \

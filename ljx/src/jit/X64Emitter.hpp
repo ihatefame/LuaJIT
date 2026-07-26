@@ -358,6 +358,20 @@ public:
         U8(static_cast<std::uint8_t>(0xC0 | ((uDst & 7) << 3) | (uSrc & 7)));
         U32(u);
     }
+    // sqrtsd xmmDst, xmmSrc   F2 [REX] 0F 51 /r
+    void Sqrtsd(std::uint8_t uDst, std::uint8_t uSrc) {
+        U8(0xF2);
+        RexForXmmXmm(uDst, uSrc);
+        U8(0x0F); U8(0x51);
+        U8(static_cast<std::uint8_t>(0xC0 | ((uDst & 7) << 3) | (uSrc & 7)));
+    }
+    // andpd xmmDst, xmmSrc    66 [REX] 0F 54 /r
+    void Andpd(std::uint8_t uDst, std::uint8_t uSrc) {
+        U8(0x66);
+        RexForXmmXmm(uDst, uSrc);
+        U8(0x0F); U8(0x54);
+        U8(static_cast<std::uint8_t>(0xC0 | ((uDst & 7) << 3) | (uSrc & 7)));
+    }
     // sub/add rsp, imm32
     void SubRspImm32(std::uint32_t u) { U8(0x48); U8(0x81); U8(0xEC); U32(u); }
     void AddRspImm32(std::uint32_t u) { U8(0x48); U8(0x81); U8(0xC4); U32(u); }

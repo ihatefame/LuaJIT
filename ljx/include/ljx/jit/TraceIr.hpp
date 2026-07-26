@@ -76,6 +76,7 @@ enum class EIrType : std::uint8_t {
     X(CallSetNewK)    /* rOp1 = desc tab|val<<16; rOp2 = key constant        */ \
     X(CallCat)        /* rOp1 = desc first|count<<8; -> tagged string        */ \
     X(CallLen)        /* rOp1 = desc table slot; -> length as Int            */ \
+    X(CallNewFunc)    /* rOp1 = desc protoIdx|frameBase<<16; -> tagged func */ \
     /* control */                                                              \
     X(Loop)           /* the back edge                                      */ \
     X(End)            /* terminal: write everything back, leave the trace   */
@@ -103,6 +104,7 @@ enum class EIrOp : std::uint8_t {
         case EIrOp::CallSetNewK:
         case EIrOp::CallCat:
         case EIrOp::CallLen:
+        case EIrOp::CallNewFunc:
         case EIrOp::Loop:
         case EIrOp::End:
             return false;

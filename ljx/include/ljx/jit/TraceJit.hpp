@@ -246,5 +246,7 @@ std::uint64_t TraceHelpCat(vm::C_Universe* pUni, vm::TValue_t* pBase,
                            std::uint32_t uDesc, std::uint32_t uTop);
 std::uint64_t TraceHelpLen(vm::C_Universe* pUni, vm::TValue_t* pBase,
                            std::uint32_t uDesc, std::uint32_t uTop);
+std::uint64_t TraceHelpNewFunc(vm::C_Universe* pUni, vm::TValue_t* pBase,
+                               std::uint32_t uDesc, std::uint32_t uTop);
 
 }  // namespace ljx::jit

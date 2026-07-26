@@ -240,7 +240,7 @@ void C_TraceAsm::ComputeInvariance() {
             // Helper calls have effects (allocation, key creation) and their
             // constant operands would otherwise satisfy the default rule.
             case EIrOp::CallNewTab: case EIrOp::CallSetNew: case EIrOp::CallSetNewK:
-            case EIrOp::CallCat: case EIrOp::CallLen:
+            case EIrOp::CallCat: case EIrOp::CallLen: case EIrOp::CallNewFunc:
                 break;
             case EIrOp::LoadU32:
                 bInv = !bResizes && IsStableField(ins.rOp1) && Inv(ins.rOp1);
@@ -921,6 +921,8 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpCat), true);
         case EIrOp::CallLen:
             return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpLen), true);
+        case EIrOp::CallNewFunc:
+            return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpNewFunc), true);
 
         case EIrOp::Loop:
             EmitBackEdge();

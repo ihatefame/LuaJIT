@@ -51,6 +51,10 @@ check trace_invalidate "$(printf '202099\n36004\n28004\n6001\n12000\n102049\n400
 # Allocation in traces: appends, fresh tables, string building, GC pressure
 # inside compiled loops, computed string keys.
 check trace_alloc "$(printf '3000\t2\t6000\n1\t4000\t400\n17700\n98775\n1\t500\n2000\t4')"
+# Closures and calls: fresh closures per iteration (PC-guarded calls), two
+# protos through one call site, upvalue closures, memoization tables with
+# number keys in the hash part.
+check trace_func "$(printf '1300000\n1000\t1000\n45150\n144000\n336000')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
 # script in tests/lua is run both ways and the outputs compared.

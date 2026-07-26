@@ -59,6 +59,26 @@ constexpr std::int32_t kNodeSize = static_cast<std::int32_t>(sizeof(vm::TableNod
 
 constexpr std::int32_t kOfsStrSid = static_cast<std::int32_t>(offsetof(C_GcString, m_uSid));
 constexpr std::int32_t kOfsStrLen = static_cast<std::int32_t>(offsetof(C_GcString, m_uLength));
+constexpr std::int32_t kOfsFuncPc = static_cast<std::int32_t>(offsetof(C_GcFunction, m_pPc));
+
+// Mirrors rt/Table.cpp — a number key's main position, computed at record
+// time (number keys reach the hash walk only as guarded constants).
+std::uint32_t NumKeyHash(std::uint64_t uBits) noexcept {
+    auto uLo = static_cast<std::uint32_t>(uBits);
+    auto uHi = static_cast<std::uint32_t>(uBits >> 32);
+    uLo ^= uHi;
+    uHi = core::RotL32(uHi, 14);
+    uLo -= uHi;
+    uHi = core::RotL32(uHi, 5);
+    uHi ^= uLo;
+    uHi -= core::RotL32(uLo, 13);
+    return uHi;
+}
+
+TValue_t CanonicalNumKey(const TValue_t& tvKey) noexcept {
+    if (tvKey.uRaw == std::uint64_t{1} << 63) return TValue_t::Number(0.0);
+    return tvKey;
+}
 
 constexpr std::uint32_t kMaxChainWalk = 4;
 
@@ -810,6 +830,15 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
             SetSlot(nB + uA, rRes);
             return true;
         }
+        case EBcOp::FNew: {
+            const std::uint32_t uDesc =
+                static_cast<std::uint32_t>(ins.D()) | (static_cast<std::uint32_t>(nB) << 16);
+            const IrRef rRes = EmitSnapped(EIrOp::CallNewFunc, EIrType::Func,
+                                           ConstantInt(uDesc), kIrNone, pNext - 1);
+            if (rRes == kIrNone) return false;
+            SetSlot(nB + uA, rRes);
+            return true;
+        }
         case EBcOp::Cat: return RecordCat(ins, pNext);
         case EBcOp::Len: return RecordLen(ins, pNext);
 
@@ -1068,8 +1097,60 @@ bool C_TraceJit::RecordForL(const BcIns_t& ins, const BcIns_t* pNext) {
 IrRef C_TraceJit::HashNodeRef(IrRef rTabPtr, const C_GcTable* pTab, TValue_t tvKey,
                               IrRef rKeyRef, const BcIns_t* pResumePc, bool& bAbsent) {
     bAbsent = false;
-    if (!tvKey.Is(EValueTag::String)) return kIrNone;   // only string keys, for now
     const std::uintptr_t uArena = m_pUniverse->ArenaBase();
+    if (tvKey.IsDouble()) {
+        // Number keys reach the hash part as guarded CONSTANTS (the caller
+        // pinned the key's value), so the main position folds at record time.
+        tvKey = CanonicalNumKey(tvKey);
+        const std::uint32_t uNumHash = NumKeyHash(tvKey.uRaw);
+        const IrRef rHmaskN = Emit(EIrOp::LoadU32, EIrType::Int,
+                                   Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
+                                        ConstantInt(kOfsTabHmask)),
+                                   kIrNone);
+        // The mask itself must be pinned: the folded main position is only
+        // right for the mask it was computed against.
+        (void)EmitGuard(EIrOp::GuardEqI, rHmaskN, ConstantInt(pTab->m_uHashMask), pResumePc);
+        if (m_eState != ETraceState::Recording) return kIrNone;
+        const IrRef rNodesN = Emit(EIrOp::RefPtr, EIrType::Ptr,
+                                   Emit(EIrOp::LoadU32, EIrType::Int,
+                                        Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
+                                             ConstantInt(kOfsTabNodes)),
+                                        kIrNone),
+                                   kIrNone);
+        IrRef rNode = Emit(EIrOp::AddK, EIrType::Ptr, rNodesN,
+                           ConstantInt(static_cast<std::int64_t>(uNumHash & pTab->m_uHashMask) *
+                                       kNodeSize));
+        const auto* pNode =
+            static_cast<const vm::TableNode_t*>(core::RefToPtr(uArena, pTab->m_rNodes)) +
+            (uNumHash & pTab->m_uHashMask);
+        const IrRef rKeyConst = Constant(tvKey);
+        for (std::uint32_t uStep = 0; uStep < kMaxChainWalk; ++uStep) {
+            const IrRef rNodeKey = Emit(EIrOp::LoadTV, EIrType::Int,
+                                        Emit(EIrOp::AddK, EIrType::Ptr, rNode,
+                                             ConstantInt(kOfsNodeKey)),
+                                        kIrNone);
+            if (pNode->tvKey == tvKey) {
+                (void)EmitGuard(EIrOp::GuardEq, rNodeKey, Materialize(rKeyConst), pResumePc);
+                return m_eState == ETraceState::Recording ? rNode : kIrNone;
+            }
+            (void)EmitGuard(EIrOp::GuardNe, rNodeKey, Materialize(rKeyConst), pResumePc);
+            if (m_eState != ETraceState::Recording) return kIrNone;
+            const IrRef rNextIdx = Emit(EIrOp::LoadU32, EIrType::Int,
+                                        Emit(EIrOp::AddK, EIrType::Ptr, rNode,
+                                             ConstantInt(kOfsNodeNext)),
+                                        kIrNone);
+            if (pNode->rNext.IsNull()) {
+                (void)EmitGuard(EIrOp::GuardEqI, rNextIdx, ConstantInt(0), pResumePc);
+                bAbsent = m_eState == ETraceState::Recording;
+                return kIrNone;
+            }
+            rNode = Emit(EIrOp::RefPtr, EIrType::Ptr, rNextIdx, kIrNone);
+            pNode = static_cast<const vm::TableNode_t*>(core::RefToPtr(uArena, pNode->rNext));
+            if (rNode == kIrNone) return kIrNone;
+        }
+        return kIrNone;
+    }
+    if (!tvKey.Is(EValueTag::String)) return kIrNone;
     const auto* pStr = static_cast<const C_GcString*>(tvKey.AsGcPointer());
 
     // The main position is computed the way the runtime computes it — mask
@@ -1147,8 +1228,49 @@ bool C_TraceJit::RecordTableGet(const BcIns_t& ins, const BcIns_t* pNext, TValue
     if (tvKey.IsDouble()) {
         const double flKey = tvKey.AsDouble();
         const auto nKey = static_cast<std::int64_t>(flKey);
-        if (static_cast<double>(nKey) != flKey) return false;
-        if (static_cast<std::uint64_t>(nKey) >= pTab->m_uArraySize) return false;
+        const bool bIntegral = static_cast<double>(nKey) == flKey;
+        if (!bIntegral || static_cast<std::uint64_t>(nKey) >= pTab->m_uArraySize) {
+            // Not in the array part: a HASH lookup with a number key. Guard
+            // the key to its observed value; the walk then folds like a
+            // constant string key. (Memoization tables live here.)
+            if (rKeyDynamic != kIrNone && !IsConstRef(rKeyDynamic)) {
+                if (TypeOf(rKeyDynamic) != EIrType::Num) return false;
+                (void)EmitGuard(EIrOp::GuardFEq, Materialize(rKeyDynamic),
+                                Materialize(Constant(tvKey)), pResumePc);
+                if (m_eState != ETraceState::Recording) return false;
+            }
+            if (bIntegral && nKey >= 0) {
+                // The array part can GROW to cover an integral key that the
+                // hash part proves absent: pin "still beyond the array".
+                const IrRef rASize = Emit(EIrOp::LoadU32, EIrType::Int,
+                                          Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
+                                               ConstantInt(kOfsTabAsize)),
+                                          kIrNone);
+                (void)EmitGuard(EIrOp::GuardBelow, rASize,
+                                Materialize(ConstantInt(nKey + 1)), pResumePc);
+                if (m_eState != ETraceState::Recording) return false;
+            }
+            bool bAbsentNum = false;
+            const IrRef rNodeNum =
+                HashNodeRef(rTabPtr, pTab, tvKey, kIrNone, pResumePc, bAbsentNum);
+            if (m_eState != ETraceState::Recording) return false;
+            if (bAbsentNum) {
+                if (!pTab->m_rMetatable.IsNull()) return false;
+                if (!GuardNoMetatable(rTabPtr, pResumePc)) return false;
+                SetSlot(nB + ins.A(), Constant(TValue_t::Nil()));
+                return true;
+            }
+            if (rNodeNum == kIrNone) return false;
+            const TValue_t* pSlotNum = pTab->Get(*m_pUniverse, tvKey);
+            if (!pSlotNum || pSlotNum->IsNil()) return false;
+            const EIrType eTypeNum = ObservedType(*pSlotNum);
+            if (eTypeNum == EIrType::Nothing) return false;
+            const IrRef rValNum =
+                EmitSnapped(EIrOp::LoadTV, eTypeNum, rNodeNum, kIrNone, pResumePc);
+            if (rValNum == kIrNone) return false;
+            SetSlot(nB + ins.A(), rValNum);
+            return true;
+        }
         IrRef rIdx;
         if (rKeyDynamic != kIrNone) {
             if (TypeOf(rKeyDynamic) != EIrType::Num) return false;
@@ -1471,8 +1593,22 @@ bool C_TraceJit::RecordCall(const BcIns_t& ins, const BcIns_t* pNext) {
 
     const IrRef rFunc = SlotRef(nB + static_cast<std::int32_t>(uA));
     if (rFunc == kIrNone) return false;
-    if (!IsConstRef(rFunc))
-        (void)EmitGuard(EIrOp::GuardEq, rFunc, Constant(tvFunc), pNext - 1);
+    if (!IsConstRef(rFunc)) {
+        if (pProto->m_uUpvalCount == 0) {
+            // An upvalue-free closure IS its bytecode: guard the dispatch PC
+            // instead of the closure identity, and a callback recreated on
+            // every iteration stays on the trace.
+            (void)EmitGuard(EIrOp::GuardEq,
+                            Emit(EIrOp::LoadTV, EIrType::Int,
+                                 Emit(EIrOp::AddK, EIrType::Ptr,
+                                      Emit(EIrOp::TabPtr, EIrType::Ptr, rFunc, kIrNone),
+                                      ConstantInt(kOfsFuncPc)),
+                                 kIrNone),
+                            Materialize(ConstantPtr(pFn->m_pPc)), pNext - 1);
+        } else {
+            (void)EmitGuard(EIrOp::GuardEq, rFunc, Materialize(Constant(tvFunc)), pNext - 1);
+        }
+    }
     if (m_eState != ETraceState::Recording) return false;
 
     // The frame link is a constant: the return PC is fixed for this call site.

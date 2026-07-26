@@ -1312,6 +1312,39 @@ using vm::C_GcTable;
 using vm::EValueTag;
 using vm::TValue_t;
 
+std::uint64_t TraceHelpNewFunc(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
+                               std::uint32_t uTop) {
+    vm::TraceGcPoint(pUni, pBase, uTop);
+    // Mirror of OpFNew, with the frame located by the recorded base offset.
+    TValue_t* pFrame = pBase + (uDesc >> 16);
+    auto* pParent = static_cast<vm::C_GcFunction*>(pFrame[-2].AsGcPointer());
+    const vm::C_GcProto* pParentProto = vm::C_GcProto::FromBytecode(pParent->m_pPc);
+    const TValue_t* pKBase = vm::KBaseOf(pUni, pParentProto);
+    const auto* pKgc = reinterpret_cast<const core::GcRef_t*>(pKBase);
+    auto* pProto = pUni->Deref<vm::C_GcProto>(
+        pKgc[-static_cast<std::int32_t>((uDesc & 0xffff) + 1)]);
+    const std::uint32_t uUpvals = pProto->m_uUpvalCount;
+    auto* pFn = static_cast<vm::C_GcFunction*>(pUni->Gc().AllocObject(
+        vm::EGcObjectType::Function, vm::C_GcFunction::LuaAllocSize(uUpvals)));
+    pFn->m_Header.uExtra1 = 0;
+    pFn->m_Header.uExtra2 = static_cast<std::uint8_t>(uUpvals);
+    pFn->m_rEnv = pUni->MakeRef(pUni->Globals());
+    pFn->m_pPc = pProto->Bytecode();
+    const auto* pDescs = static_cast<const std::uint16_t*>(
+        core::RefToPtr(pUni->ArenaBase(), pProto->m_rUpvalDescs));
+    for (std::uint32_t uI = 0; uI < uUpvals; ++uI) {
+        const std::uint16_t uUpDesc = pDescs[uI];
+        if (uUpDesc & 0x8000) {
+            vm::C_GcUpvalue* pUpval =
+                vm::FindUpvalue(pUni, pUni->MainThread(), pFrame + (uUpDesc & 0xff));
+            pFn->UpvalRefs()[uI] = pUni->MakeRef(pUpval);
+        } else {
+            pFn->UpvalRefs()[uI] = pParent->UpvalRefs()[uUpDesc];
+        }
+    }
+    return TValue_t::GcObject(EValueTag::Function, pFn).uRaw;
+}
+
 std::uint64_t TraceHelpNewTab(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
                               std::uint32_t uTop) {
     vm::TraceGcPoint(pUni, pBase, uTop);

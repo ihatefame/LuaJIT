@@ -42,6 +42,8 @@ enum class EIrType : std::uint8_t {
     /* entry type guard; SStore is the write-through for slots the trace     */\
     /* assigns but never reads (see TRACE_DESIGN.md §6).                     */\
     X(SLoad) X(SStore)                                                         \
+    X(KLoad)          /* constant -> register, so the loop body never          */ \
+                      /* rematerializes it                                    */ \
     /* arithmetic on guarded numbers */                                        \
     X(Add) X(Sub) X(Mul) X(Div) X(Mod) X(Neg)                                  \
     X(ToInt)          /* double -> int64, guarded exact                     */ \

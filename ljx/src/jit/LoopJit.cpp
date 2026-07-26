@@ -198,7 +198,8 @@ bool JitDebug() {
 CompiledLoop_f C_LoopJit::LookupOrTick(const BcIns_t* pForIPc, std::uint8_t uBaseSlot) {
     // LJX_NOJIT=1 forces everything through the interpreter — the reference
     // side of the differential test in tests/run_lua_tests.sh.
-    static const bool bDisabled = std::getenv("LJX_NOJIT") != nullptr;
+    static const bool bDisabled = std::getenv("LJX_NOJIT") != nullptr ||
+                                 std::getenv("LJX_NOLOOPJIT") != nullptr;
     if (bDisabled) return nullptr;
     LoopState_t& state = m_mapLoops[pForIPc];
     if (state.fnCompiled) return state.fnCompiled;

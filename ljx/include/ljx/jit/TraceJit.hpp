@@ -104,6 +104,7 @@ private:
     [[nodiscard]] IrRef EmitGuard(EIrOp eOp, IrRef rOp1, IrRef rOp2, const vm::BcIns_t* pResumePc);
     [[nodiscard]] IrRef Constant(const vm::TValue_t& tvValue);
     [[nodiscard]] IrRef ConstantNum(double flValue);
+    [[nodiscard]] IrRef Materialize(IrRef rRef);
     [[nodiscard]] IrRef ConstantInt(std::int64_t nValue);
     [[nodiscard]] IrRef ConstantPtr(const void* pPtr);
     [[nodiscard]] std::uint32_t TakeSnapshot(const vm::BcIns_t* pResumePc);

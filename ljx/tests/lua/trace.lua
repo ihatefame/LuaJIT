@@ -102,3 +102,23 @@ for i = 1, 400 do
   tot = tot + o:dot(o)
 end
 print("poly", tot)
+
+-- 10. enough loop-invariant table addresses to exhaust the integer registers,
+--     so hoisted values have to be spilled and reloaded inside the loop. The
+--     spill store for a value defined in the pre-roll must NOT land in the
+--     loop body: on the second iteration that register holds something else.
+local t1 = {n = 1, m = 10}
+local t2 = {n = 2, m = 20}
+local t3 = {n = 3, m = 30}
+local t4 = {n = 4, m = 40}
+local t5 = {n = 5, m = 50}
+local t6 = {n = 6, m = 60}
+local reg = {}
+local acc2 = 0
+for i = 1, 500 do
+  local k = keys[(i % 5) + 1]
+  reg[k] = (reg[k] or 0) + t1.n + t2.n + t3.n + t4.n + t5.n + t6.n
+  acc2 = acc2 + t1.m + t2.m + t3.m + t4.m + t5.m + t6.m
+  t1.n = t1.n + 0        -- a store, so the version bump stays in the loop
+end
+print("spill", acc2, reg.alpha, reg.epsilon)

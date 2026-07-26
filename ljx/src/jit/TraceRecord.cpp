@@ -171,6 +171,15 @@ IrRef C_TraceJit::Constant(const TValue_t& tvValue) {
 
 IrRef C_TraceJit::ConstantNum(double flValue) { return Constant(TValue_t::Number(flValue)); }
 
+// Operands of real machine instructions must live in registers. Wrapping a
+// constant in KLoad lets CSE share it and lets the hoisting pass lift the
+// materialization out of the loop, instead of rebuilding the immediate on
+// every iteration.
+IrRef C_TraceJit::Materialize(IrRef rRef) {
+    if (rRef == kIrNone || !IsConstRef(rRef)) return rRef;
+    return Emit(EIrOp::KLoad, TypeOf(rRef), rRef, kIrNone);
+}
+
 IrRef C_TraceJit::ConstantInt(std::int64_t nValue) {
     const auto uRaw = static_cast<std::uint64_t>(nValue);
     for (std::size_t uI = 0; uI < m_vConst.size(); ++uI)
@@ -233,8 +242,6 @@ void C_TraceJit::SetSlot(std::int32_t nSlot, IrRef rValue) {
     const auto uIdx = static_cast<std::size_t>(nSlot + kSlotBias);
     if (nSlot > m_nTopSlot) m_nTopSlot = nSlot;
     m_vSlotValue[uIdx] = rValue;
-    if (m_vSlotEntry[uIdx] == kIrNone)
-        (void)Emit(EIrOp::SStore, TypeOf(rValue), static_cast<IrRef>(uIdx), rValue);
 }
 
 std::uint32_t C_TraceJit::TakeSnapshot(const BcIns_t* pResumePc) {
@@ -243,7 +250,7 @@ std::uint32_t C_TraceJit::TakeSnapshot(const BcIns_t* pResumePc) {
     snap.pResumePc = pResumePc;
     snap.nBaseOffset = m_nBaseOffset;
     for (std::size_t uI = 0; uI < m_vSlotValue.size(); ++uI) {
-        if (m_vSlotValue[uI] == kIrNone || m_vSlotEntry[uI] == kIrNone) continue;
+        if (m_vSlotValue[uI] == kIrNone) continue;
         m_vSnapSlots.push_back(SnapSlot_t{static_cast<std::int32_t>(uI) - kSlotBias,
                                           m_vSlotValue[uI]});
     }
@@ -298,6 +305,16 @@ void C_TraceJit::CloseLoop() {
         AbortRecording(EAbort::LeftFrame, "loop closed in an inlined frame");
         return;
     }
+    // Slots the trace writes but never reads are not carried in registers, so
+    // the Lua stack must hold their value at the loop top: a guard early in an
+    // iteration can exit before that slot is assigned again, and the
+    // interpreter has to see what the PREVIOUS iteration left there. One store
+    // at the back edge is enough — a guard after the assignment is covered by
+    // the snapshot instead.
+    for (std::size_t uI = 0; uI < m_vSlotValue.size(); ++uI)
+        if (m_vSlotValue[uI] != kIrNone && m_vSlotEntry[uI] == kIrNone)
+            (void)Emit(EIrOp::SStore, TypeOf(m_vSlotValue[uI]), static_cast<IrRef>(uI),
+                       m_vSlotValue[uI]);
     (void)Emit(EIrOp::Loop, EIrType::Nothing, kIrNone, kIrNone);
     Trace_t* pTrace = Assemble();
     m_eState = ETraceState::Idle;
@@ -461,7 +478,8 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
             auto* pFn = static_cast<C_GcFunction*>(m_pBase[-2].AsGcPointer());
             if (!IsConstRef(rFunc))
                 (void)EmitGuard(EIrOp::GuardEq, rFunc,
-                                Constant(TValue_t::GcObject(EValueTag::Function, pFn)),
+                                Materialize(Constant(
+                                    TValue_t::GcObject(EValueTag::Function, pFn))),
                                 pNext - 1);
             auto* pUpval = m_pUniverse->Deref<C_GcUpvalue>(pFn->UpvalRefs()[ins.D()]);
             PinValue(TValue_t::GcObject(EValueTag::UpValue, pUpval));
@@ -529,7 +547,7 @@ bool C_TraceJit::RecordArith(const BcIns_t& ins, EIrOp eOp, int nKind) {
         rRight = SlotRef(nB + (ins.D() >> 8));
     }
     if (TypeOf(rLeft) != EIrType::Num || TypeOf(rRight) != EIrType::Num) return false;
-    const IrRef rRes = Emit(eOp, EIrType::Num, rLeft, rRight);
+    const IrRef rRes = Emit(eOp, EIrType::Num, Materialize(rLeft), Materialize(rRight));
     if (rRes == kIrNone) return false;
     SetSlot(nB + ins.A(), rRes);
     return true;
@@ -557,7 +575,7 @@ bool C_TraceJit::RecordCompare(const BcIns_t& ins, const BcIns_t* pNext) {
             default:          bTaken = !(flA <= flB); eGuard = bTaken ? EIrOp::GuardGt : EIrOp::GuardLe; break;
         }
         const BcIns_t* pExitPc = bTaken ? pNext + 1 : pNext + 1 + insJmp.JumpTarget();
-        (void)EmitGuard(eGuard, rLeft, rRight, pExitPc);
+        (void)EmitGuard(eGuard, Materialize(rLeft), Materialize(rRight), pExitPc);
         return m_eState == ETraceState::Recording;
     }
 
@@ -595,7 +613,8 @@ bool C_TraceJit::RecordCompare(const BcIns_t& ins, const BcIns_t* pNext) {
                        eOp == EBcOp::IsEqN || eOp == EBcOp::IsEqP;
     bTaken = bIsEq ? bEqual : !bEqual;
     const BcIns_t* pExitPc = bTaken ? pNext + 1 : pNext + 1 + insJmp.JumpTarget();
-    (void)EmitGuard(bEqual ? EIrOp::GuardEq : EIrOp::GuardNe, rLeft, rRight, pExitPc);
+    (void)EmitGuard(bEqual ? EIrOp::GuardEq : EIrOp::GuardNe, Materialize(rLeft),
+                    Materialize(rRight), pExitPc);
     return m_eState == ETraceState::Recording;
 }
 
@@ -632,7 +651,8 @@ bool C_TraceJit::RecordForL(const BcIns_t& ins, const BcIns_t* pNext) {
     // variable only when the loop continues, so the index update must be
     // visible to the guard's snapshot and the copy must not be.
     SetSlot(nSlot, rNew);
-    (void)EmitGuard(flStep >= 0 ? EIrOp::GuardLe : EIrOp::GuardGe, rNew, rStop, pNext);
+    (void)EmitGuard(flStep >= 0 ? EIrOp::GuardLe : EIrOp::GuardGe, rNew, Materialize(rStop),
+                    pNext);
     if (m_eState != ETraceState::Recording) return false;
     SetSlot(nSlot + 3, rNew);
     return true;
@@ -669,7 +689,7 @@ IrRef C_TraceJit::HashNodeRef(IrRef rTabPtr, const C_GcTable* pTab, TValue_t tvK
                     kIrNone);
         rKeyTagged = rKeyRef;
     }
-    const IrRef rMain = Emit(EIrOp::AndInt, EIrType::Int, rSid, rHmask);
+    const IrRef rMain = Emit(EIrOp::AndInt, EIrType::Int, Materialize(rSid), rHmask);
     // A node is three granules wide, so the byte offset is an IdxPtr scale.
     const IrRef rGranule = Emit(EIrOp::MulK, EIrType::Int, rMain,
                                 ConstantInt(kNodeSize / 8));
@@ -690,10 +710,10 @@ IrRef C_TraceJit::HashNodeRef(IrRef rTabPtr, const C_GcTable* pTab, TValue_t tvK
                                          ConstantInt(kOfsNodeKey)),
                                     kIrNone);
         if (pNode->tvKey == tvKey) {
-            (void)EmitGuard(EIrOp::GuardEq, rNodeKey, rKeyTagged, pResumePc);
+            (void)EmitGuard(EIrOp::GuardEq, rNodeKey, Materialize(rKeyTagged), pResumePc);
             return m_eState == ETraceState::Recording ? rNode : kIrNone;
         }
-        (void)EmitGuard(EIrOp::GuardNe, rNodeKey, rKeyTagged, pResumePc);
+        (void)EmitGuard(EIrOp::GuardNe, rNodeKey, Materialize(rKeyTagged), pResumePc);
         if (m_eState != ETraceState::Recording) return kIrNone;
         const IrRef rNextIdx = Emit(EIrOp::LoadU32, EIrType::Int,
                                     Emit(EIrOp::AddK, EIrType::Ptr, rNode,
@@ -739,14 +759,14 @@ bool C_TraceJit::RecordTableGet(const BcIns_t& ins, const BcIns_t* pNext, TValue
                                  Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
                                       ConstantInt(kOfsTabAsize)),
                                  kIrNone);
-        (void)EmitGuard(EIrOp::GuardBelow, rIdx, rSize, pResumePc);
+        (void)EmitGuard(EIrOp::GuardBelow, Materialize(rIdx), rSize, pResumePc);
         const IrRef rArr = Emit(EIrOp::RefPtr, EIrType::Ptr,
                                 Emit(EIrOp::LoadU32, EIrType::Int,
                                      Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
                                           ConstantInt(kOfsTabArray)),
                                      kIrNone),
                                 kIrNone);
-        const IrRef rElem = Emit(EIrOp::IdxPtr, EIrType::Ptr, rArr, rIdx);
+        const IrRef rElem = Emit(EIrOp::IdxPtr, EIrType::Ptr, rArr, Materialize(rIdx));
         const TValue_t* pElem =
             static_cast<TValue_t*>(core::RefToPtr(m_pUniverse->ArenaBase(), pTab->m_rArray)) + nKey;
         const EIrType eType = ObservedType(*pElem);
@@ -849,14 +869,14 @@ bool C_TraceJit::RecordTableSet(const BcIns_t& ins, const BcIns_t* pNext, TValue
                                  Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
                                       ConstantInt(kOfsTabAsize)),
                                  kIrNone);
-        (void)EmitGuard(EIrOp::GuardBelow, rIdx, rSize, pResumePc);
+        (void)EmitGuard(EIrOp::GuardBelow, Materialize(rIdx), rSize, pResumePc);
         const IrRef rArr = Emit(EIrOp::RefPtr, EIrType::Ptr,
                                 Emit(EIrOp::LoadU32, EIrType::Int,
                                      Emit(EIrOp::AddK, EIrType::Ptr, rTabPtr,
                                           ConstantInt(kOfsTabArray)),
                                      kIrNone),
                                 kIrNone);
-        const IrRef rElem = Emit(EIrOp::IdxPtr, EIrType::Ptr, rArr, rIdx);
+        const IrRef rElem = Emit(EIrOp::IdxPtr, EIrType::Ptr, rArr, Materialize(rIdx));
         (void)Emit(EIrOp::StoreTV, TypeOf(rValue), rElem, rValue);
         return m_eState == ETraceState::Recording;
     }

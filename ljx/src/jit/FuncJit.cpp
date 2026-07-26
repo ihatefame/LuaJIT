@@ -83,7 +83,8 @@ std::uint8_t* C_FuncJit::AllocCode(std::size_t uBytes) {
 
 const CompiledFunc_t* C_FuncJit::LookupOrTick(vm::C_GcProto* pProto,
                                               const vm::C_GcFunction* pFn) {
-    static const bool bDisabled = std::getenv("LJX_NOJIT") != nullptr;
+    static const bool bDisabled = std::getenv("LJX_NOJIT") != nullptr ||
+                                 std::getenv("LJX_NOFUNCJIT") != nullptr;
     if (bDisabled) return nullptr;
     if (pProto->m_pNative) {
         auto* pCompiled = static_cast<CompiledFunc_t*>(pProto->m_pNative);

@@ -321,11 +321,18 @@ bool C_TraceAsm::Allocate(std::size_t uIdx, bool bFloat, std::uint8_t& uOut) {
     }
     if (uVictim == kNoReg) { m_bFailed = true; uOut = kNoReg; return false; }
     const std::size_t uOwn = pOwner[uVictim] - 1;
-    if (bFloat)
-        m_Emit.MovsdStore(uVictim, kRsp, SpillDisp(uOwn));
-    else
-        m_Emit.MovStoreR64(uVictim, kRsp, SpillDisp(uOwn));
-    m_vSpilled[uOwn] = 1;
+    // A value whose home slot is already written needs no store here — and
+    // MUST not get one: the eviction point is inside the loop body, so on the
+    // next iteration the register holds something else and the store would
+    // overwrite the home slot with garbage. Pre-roll values are written to
+    // their home slot at definition for exactly this reason.
+    if (!m_vSpilled[uOwn]) {
+        if (bFloat)
+            m_Emit.MovsdStore(uVictim, kRsp, SpillDisp(uOwn));
+        else
+            m_Emit.MovStoreR64(uVictim, kRsp, SpillDisp(uOwn));
+        m_vSpilled[uOwn] = 1;
+    }
     m_vReg[uOwn] = kNoReg;
     pOwner[uVictim] = static_cast<std::uint32_t>(uIdx) + 1;
     m_vReg[uIdx] = uVictim;
@@ -435,6 +442,15 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
                 m_Emit.MovqXmmR64(uDst, kGprScratch[1]);
             else
                 m_Emit.MovR64R64(uDst, kGprScratch[1]);
+            return true;
+        }
+
+        case EIrOp::KLoad: {
+            if (!Allocate(uIdx, bFloat, uDst)) return false;
+            if (bFloat)
+                MaterializeConstXmm(uDst, ConstOf(ins.rOp1));
+            else
+                MaterializeConstGpr(uDst, ConstOf(ins.rOp1));
             return true;
         }
 
@@ -731,6 +747,17 @@ bool C_TraceAsm::Run() {
         UnpinAll();
         FreeDead(uP);
         if (!EmitOne(uI) || m_bFailed) return false;
+        // Everything defined in the pre-roll is written to its home slot right
+        // away: the definition runs once, so this is the only point at which a
+        // spill store is guaranteed to see the right value.
+        if (uP < m_uHoisted && m_vIns[uI].eOp != EIrOp::SLoad && m_vReg[uI] != kNoReg &&
+            !m_vSpilled[uI]) {
+            if (IsFloatType(m_vIns[uI].eType))
+                m_Emit.MovsdStore(m_vReg[uI], kRsp, SpillDisp(uI));
+            else
+                m_Emit.MovStoreR64(m_vReg[uI], kRsp, SpillDisp(uI));
+            m_vSpilled[uI] = 1;
+        }
     }
     if (!bAtLoopTop) m_uLoopTop = m_Emit.Here();
     const std::size_t uBackEdge = m_Emit.Jmp();

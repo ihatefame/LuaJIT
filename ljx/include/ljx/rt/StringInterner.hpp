@@ -32,26 +32,24 @@ public:
     static constexpr std::uint32_t kMinTableSize = 256;        // power of two
     static constexpr std::uint32_t kMaxChainCollisions = 32;   // dense-hash trigger
 
-    explicit C_StringInterner(vm::C_Universe& uni) noexcept;
+    C_StringInterner() noexcept = default;
+    void Init(vm::C_Universe& uni);   // allocates chains, interns ""
 
     // THE hot entry: intern (or resurrect) a byte string.
     [[nodiscard]] vm::C_GcString* Intern(std::string_view svBytes);
     [[nodiscard]] vm::C_GcString* Empty() const noexcept { return m_pEmpty; }
 
-    // GC integration: sweep one intern chain per call (sharded sweep).
-    void SweepChain(std::uint32_t uChainIndex) noexcept;
-    void MaybeResize();          // grow at 100% load; shrink after sweep
-    void ReseedStrIds() noexcept;  // periodic security reseed of dense ids
+    // GC integration (v1: stop-the-world sweep over all chains).
+    void SweepAll() noexcept;
+    void MaybeResize();          // grow at 100% load
 
     [[nodiscard]] std::uint32_t Count() const noexcept { return m_uCount; }
+    [[nodiscard]] std::uint32_t ChainCount() const noexcept { return m_uMask + 1; }
 
 private:
     [[nodiscard]] core::StrHash_t HashSparse(std::string_view svBytes) const noexcept;
-    [[nodiscard]] core::StrHash_t HashDense(std::string_view svBytes) const noexcept;
-    void EscalateChain(std::uint32_t uChainIndex);  // sparse → dense rehash
 
-    // Chain anchors; the LOW BIT of an anchor tags a dense-hash chain (any
-    // walker must mask and preserve it — same discipline as LuaJIT).
+    vm::C_Universe* m_pUniverse = nullptr;
     core::GcRef_t* m_pChains = nullptr;
     std::uint32_t m_uMask = kMinTableSize - 1;
     std::uint32_t m_uCount = 0;

@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "ljx/vm/Object.hpp"
 
@@ -54,9 +55,21 @@ public:
 
     [[noreturn]] void ErrorAt(core::BcLine_t uLine, const char* sMessage, ...);
 
+public:
+    [[nodiscard]] vm::C_Universe& Universe() noexcept { return *m_pUniverse; }
+    [[nodiscard]] vm::C_GcString* ChunkName() const noexcept { return m_pChunkName; }
+    [[nodiscard]] core::BcLine_t LastLine() const noexcept { return m_uLastLine; }
+
 private:
     [[nodiscard]] int ReadMore() noexcept;    // cold refill path
+    [[nodiscard]] int NextChar() noexcept;
     [[nodiscard]] ETokenKind Scan(Token_t& tokOut);
+    void ReadString(Token_t& tokOut, int nQuote);
+    void ReadLongString(Token_t& tokOut, int nLevel, bool bIsComment);
+    void ReadNumber(Token_t& tokOut);
+    [[nodiscard]] int CheckLongBracket() noexcept;  // returns level or -1
+    int m_nChar = 0;                    // current character (-1 = EOF)
+    std::string m_sBuffer;              // token text scratch
 
     const char* m_pCursor = nullptr;   // hot window: two pointer compares/char
     const char* m_pWindowEnd = nullptr;

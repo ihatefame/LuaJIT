@@ -166,14 +166,15 @@ but its "keep the whole heap under 2/4 GB" allocator (`MAP_32BIT`, probing, NT h
 fragile OS dependence, and the 47-bit GC64 assumption breaks under 5-level paging/LAM.
 
 LJX: at startup, `core::C_VirtualArena` **reserves one contiguous VA range below 2^47**
-(commit-on-demand; capped at `kMaxArenaReserve` = 64 GB — the ref-width contract below).
+(commit-on-demand; capped at `kMaxArenaReserve` = 32 GB — the ref-width contract below).
 All GC memory comes from it. Consequences:
 
 - 47-bit NaN boxing is a *guaranteed contract*, not a hope about `mmap` behavior.
-- `GcRef_t` is a 32-bit **arena-relative granule index**: referents are 16-byte aligned, so
-  `base + (uint64)idx*16` (one addressing-mode operand on both ISAs) covers the full 64 GB
-  reservation — which is why the reservation is capped there, with the cap and the ref width
-  tied together by one constant. `MRef_t` is the same for non-GC memory that lives in-arena.
+- `GcRef_t` is a 32-bit **arena-relative granule index**: referents are 8-byte aligned (MRefs
+  must reach TValue-aligned interiors — stack slots, constant areas), so `base + (uint64)idx*8`
+  (one addressing-mode operand on both ISAs) covers the full 32 GB reservation — which is why
+  the reservation is capped there, with the cap and the ref width tied together by one
+  constant. `MRef_t` is the same for non-GC memory that lives in-arena.
   This generalizes LuaJIT's non-GC64 density win to arbitrarily placed heaps,
   V8-pointer-compression-style, and makes multiple isolated VMs trivial (per-VM base register
   = the existing context register).

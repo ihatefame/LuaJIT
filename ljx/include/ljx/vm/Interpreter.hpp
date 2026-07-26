@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <csetjmp>
 #include <cstdint>
 #include <type_traits>
 
@@ -18,9 +19,29 @@
 #include "ljx/vm/Frame.hpp"
 #include "ljx/vm/Object.hpp"
 
+namespace ljx::rt {
+class C_StringInterner;
+class C_MetaResolver;
+}
+namespace ljx::gc {
+class C_GarbageCollector;
+}
+
 namespace ljx::vm {
 
 class C_Universe;
+
+// VM errors unwind via setjmp/longjmp (LuaJIT's scheme) — C++ exceptions
+// cannot cross the musttail interpreter frames reliably. The error value is
+// parked in the universe and read after longjmp lands in the protecting
+// frame. NOTE: longjmp skips C++ destructors; the hot interpreter path holds
+// no unwind-sensitive C++ objects, and the rare cold helpers that build a
+// std::string before raising accept a small leak on that error edge (v1).
+struct ErrorFrame_t {
+    std::jmp_buf jb;
+    ErrorFrame_t* pPrev;
+    TValue_t* pStackTop;   // restore point for the thread stack
+};
 
 // ---------------------------------------------------------------------------
 // The handler ABI — this signature IS the interpreter's register file and,
@@ -96,6 +117,11 @@ public:
     // record/hook/profile stubs); release-ordered publication.
     void SetMode(EDispatchMode eMode) noexcept;
 
+    // Population (init only).
+    void SetStatic(std::uint32_t uOp, BcHandler_f fnHandler) noexcept {
+        m_vStatic[uOp] = fnHandler;
+    }
+
 private:
     std::atomic<BcHandler_f> m_vDynamic[kEntries]{};
     BcHandler_f m_vStatic[kEntries]{};
@@ -168,14 +194,38 @@ class C_IVmEventSink;
 class C_Universe {
 public:
     // --- creation ----------------------------------------------------------
-    [[nodiscard]] static C_Universe* Create() noexcept;   // reserves arena, seeds PRNG
+    // Reserves the arena, seeds the PRNG (refuses to start without entropy),
+    // interns fixed strings, creates the main thread/globals/registry.
+    [[nodiscard]] static C_Universe* Create(
+        std::size_t uArenaReserveBytes = core::kMaxArenaReserve) noexcept;
     void Destroy() noexcept;
 
     // --- pinned-register accessors (constant offsets from `this`) ----------
-    [[nodiscard]] C_LuaThread* MainThread() noexcept;
+    [[nodiscard]] C_LuaThread* MainThread() noexcept { return m_pMainThread; }
     [[nodiscard]] C_DispatchTable& Dispatch() noexcept { return m_Dispatch; }
     [[nodiscard]] C_HotCountTable& HotCounts() noexcept { return m_HotCounts; }
     [[nodiscard]] std::uintptr_t ArenaBase() const noexcept { return m_uArenaBase; }
+    [[nodiscard]] C_GcTable* Globals() noexcept { return m_pGlobals; }
+    [[nodiscard]] C_GcTable* Registry() noexcept { return m_pRegistry; }
+    [[nodiscard]] core::C_SegregatedAllocator& Allocator() noexcept { return *m_pAllocator; }
+    [[nodiscard]] rt::C_StringInterner& Interner() noexcept { return *m_pInterner; }
+    [[nodiscard]] rt::C_MetaResolver& Meta() noexcept { return *m_pMeta; }
+    [[nodiscard]] gc::C_GarbageCollector& Gc() noexcept { return *m_pGc; }
+    [[nodiscard]] core::C_Prng& Prng() noexcept { return m_Prng; }
+
+    // Compressed-ref decompression against this universe's arena.
+    template <typename TObj>
+    [[nodiscard]] LJX_FORCEINLINE TObj* Deref(core::GcRef_t rRef) noexcept {
+        return rRef.IsNull() ? nullptr
+                             : reinterpret_cast<TObj*>(
+                                   m_uArenaBase +
+                                   (std::uintptr_t{rRef.uIndex} << core::kCompressedRefShift));
+    }
+    [[nodiscard]] LJX_FORCEINLINE core::GcRef_t MakeRef(const void* pObject) noexcept {
+        return core::GcRef_t{
+            static_cast<std::uint32_t>((reinterpret_cast<std::uintptr_t>(pObject) - m_uArenaBase) >>
+                                       core::kCompressedRefShift)};
+    }
 
     // Shared sentinels (branch removers — see rt/ and gc/):
     [[nodiscard]] const TValue_t* NilSentinel() const noexcept { return &m_tvNil; }
@@ -207,7 +257,22 @@ public:
     TableNode_t m_NilNode;
     std::uintptr_t m_uArenaBase = 0;
     C_IVmEventSink* m_pEventSink = nullptr;
-    // … global state, string interner, GC, JIT state follow at fixed offsets.
+    core::C_VirtualArena m_Arena;
+    core::C_SegregatedAllocator* m_pAllocator = nullptr;
+    rt::C_StringInterner* m_pInterner = nullptr;
+    rt::C_MetaResolver* m_pMeta = nullptr;
+    gc::C_GarbageCollector* m_pGc = nullptr;
+    C_LuaThread* m_pMainThread = nullptr;
+    C_GcTable* m_pGlobals = nullptr;
+    C_GcTable* m_pRegistry = nullptr;
+    core::C_Prng m_Prng;
+    // 8-aligned (MRef target): shared dispatch cell all C closures point at.
+    BcIns_t m_insCFuncHeader;
+    std::uint32_t m_uPadCell = 0;
+    std::uint32_t m_uMultRes = 0;   // MULTRES protocol: count of multi values
+    std::uint32_t m_uEntryResults = 0;  // results of the innermost C-entry frame
+    ErrorFrame_t* m_pErrorTop = nullptr;   // current protected-call boundary
+    TValue_t m_tvErrorValue;               // error object across the longjmp
 };
 static_assert(std::is_standard_layout_v<C_Universe>,
               "offset-addressed from the pinned context register");
@@ -223,12 +288,14 @@ static_assert(std::is_standard_layout_v<C_Universe>,
 
 class C_Interpreter {
 public:
-    // Call into bytecode from C++ (establishes a C frame; resume/yield-aware).
+    // Call into bytecode from C++ (establishes a C frame). Errors unwind as
+    // LuaError_t exceptions — callers either protect (ProtectedCall) or let
+    // them propagate to their own protected boundary.
     static std::int32_t Call(C_LuaThread* pThread, TValue_t* pFunc, std::int32_t nArgs,
-                             std::int32_t nResults) noexcept;
+                             std::int32_t nResults);
     static std::int32_t ProtectedCall(C_LuaThread* pThread, TValue_t* pFunc,
                                       std::int32_t nArgs, std::int32_t nResults,
-                                      std::uint64_t uErrFunc) noexcept;
+                                      std::uint64_t uErrFunc);
     static std::int32_t Resume(C_LuaThread* pThread, std::int32_t nArgs) noexcept;
 
     // The per-opcode handler template; explicit instantiations populate the
@@ -242,6 +309,17 @@ public:
     // calls the handler for the restored PC (contract with jit/Snapshot.hpp).
     LJX_PRESERVE_NONE static void ReenterFromExit(TValue_t* pBase, const BcIns_t* pPc,
                                                   C_Universe* pUni);
+
+    // Populates static + dynamic tables with the handler family.
+    static void InitDispatchTables(C_DispatchTable& dispatch) noexcept;
 };
+
+// Formats a message, interns it, parks it, longjmps to the protecting frame
+// (or aborts if unprotected). Cold path.
+[[noreturn]] void RaiseError(C_Universe& uni, const char* sFormat, ...);
+[[noreturn]] void RaiseErrorValue(C_Universe& uni, const TValue_t& tvError);
+
+// Installs the v1 standard library into the universe's globals.
+void OpenStdLib(C_Universe& uni);
 
 }  // namespace ljx::vm

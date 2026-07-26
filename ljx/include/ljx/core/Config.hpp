@@ -60,6 +60,10 @@ inline constexpr EOs kOs = EOs::OtherPosix;
 
 // preserve_none frees nearly all registers for the interpreter's pinned state
 // (the modern replacement for DynASM's fixed register file).
+// preserve_none frees ~all callee-saved registers for the interpreter's pinned
+// state (the modern replacement for DynASM's fixed register file). Safe now
+// that VM errors propagate via setjmp/longjmp rather than C++ exceptions —
+// nothing throws across these frames.
 #if defined(__clang__) && __has_attribute(preserve_none)
 #define LJX_PRESERVE_NONE __attribute__((preserve_none))
 #else

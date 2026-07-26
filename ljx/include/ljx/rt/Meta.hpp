@@ -36,7 +36,8 @@ static_assert(kNegativeCacheableCount <= kNegativeCacheCapacity);
 
 class C_MetaResolver {
 public:
-    explicit C_MetaResolver(vm::C_Universe& uni) noexcept;
+    C_MetaResolver() noexcept = default;
+    void Init(vm::C_Universe& uni);   // interns and pins metamethod names
 
     // Fast absence check + cached lookup. Returns nullptr on definite absence
     // (negative-cache hit costs one byte test on the metatable header).
@@ -54,7 +55,12 @@ public:
     // (the table might be someone's metatable). Called from table set paths.
     static void InvalidateNegativeCache(vm::C_GcTable* pTable) noexcept;
 
+    // Base-type metatables (strings get the string library via __index).
+    void SetBaseMetatable(vm::EValueTag eTag, vm::C_GcTable* pMetatable) noexcept;
+    [[nodiscard]] vm::C_GcTable* BaseMetatable(vm::EValueTag eTag) noexcept;
+
 private:
+    vm::C_Universe* m_pUniverse = nullptr;
     vm::C_GcString* m_vNames[static_cast<std::size_t>(EMetaMethod::Count_)]{};
     core::GcRef_t m_vBaseMetatables[16]{};  // indexed by ~tag
 };

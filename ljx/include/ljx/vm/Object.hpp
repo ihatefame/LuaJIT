@@ -125,6 +125,12 @@ public:
     core::MRef_t m_rFreeTop;
     std::uint32_t m_uPad = 0;
 
+    // Creation: uArraySizeHint slots in the array part (0-based exclusive),
+    // 1<<uHashBits hash nodes (0 = shared nil-node). Fresh tables start with
+    // uNoMm = 0xFF (empty table: every metamethod definitely absent).
+    [[nodiscard]] static C_GcTable* New(C_Universe& uni, std::uint32_t uArraySizeHint,
+                                        std::uint32_t uHashBits);
+
     // Core operations (implementations in rt/; declared here as the contract).
     [[nodiscard]] const TValue_t* Get(C_Universe& uni, const TValue_t& tvKey) const noexcept;
     [[nodiscard]] TValue_t* Set(C_Universe& uni, const TValue_t& tvKey);
@@ -170,7 +176,8 @@ public:
     std::uint8_t m_uUpvalCount = 0;
     std::uint8_t m_uFlags = 0;        // EProtoFlag bits + 3-bit closure counter
     std::uint16_t m_uRootTrace = 0;   // root-trace chain anchor (16-bit id)
-    // … debug payload references (chunk name, compressed line/var info) follow.
+    core::GcRef_t m_rChunkName;       // interned chunk-name string
+    core::MRef_t m_rLineInfo;         // BcLine_t[m_uBcCount] (debug; may be null)
 
     [[nodiscard]] const std::uint32_t* Bytecode() const noexcept {
         return reinterpret_cast<const std::uint32_t*>(this + 1);
@@ -202,10 +209,30 @@ public:
     core::GcRef_t m_rEnv;       // offset-aliased with C_GcUserData
     core::GcRef_t m_rGcList;
     core::MRef_t m_rPc;         // uniform call dispatch target
+    std::uint32_t m_uPad = 0;   // payload below is 8-aligned
     // Lua closure: GcRef_t upvalue pointers follow inline.
     // C closure:   CFunction_f + inline TValue_t upvalues follow.
 
     [[nodiscard]] bool IsLua() const noexcept { return m_Header.uExtra1 == 0; }
+    [[nodiscard]] std::uint8_t UpvalCount() const noexcept { return m_Header.uExtra2; }
+
+    [[nodiscard]] core::GcRef_t* UpvalRefs() noexcept {  // Lua closures
+        return reinterpret_cast<core::GcRef_t*>(this + 1);
+    }
+    [[nodiscard]] CFunction_f& CFunc() noexcept {        // C closures
+        return *reinterpret_cast<CFunction_f*>(this + 1);
+    }
+    [[nodiscard]] TValue_t* CUpvalues() noexcept {       // C closures
+        return reinterpret_cast<TValue_t*>(reinterpret_cast<char*>(this + 1) +
+                                           sizeof(CFunction_f));
+    }
+
+    [[nodiscard]] static constexpr std::size_t LuaAllocSize(std::uint32_t uUpvals) noexcept {
+        return sizeof(C_GcFunction) + uUpvals * sizeof(core::GcRef_t);
+    }
+    [[nodiscard]] static constexpr std::size_t CAllocSize(std::uint32_t uUpvals) noexcept {
+        return sizeof(C_GcFunction) + sizeof(CFunction_f) + uUpvals * sizeof(TValue_t);
+    }
 };
 
 class C_GcUpvalue {
@@ -242,8 +269,9 @@ public:
 class C_LuaThread {
 public:
     GcHeader_t m_Header;        // uExtra1=dummy ffid, uExtra2=status
-    core::MRef_t m_rGlobal;     // owning universe
+    core::MRef_t m_rGlobal;     // owning universe (compressed)
     core::GcRef_t m_rGcList;
+    C_Universe* m_pUniverse = nullptr;  // direct pointer (hot C-API paths)
     TValue_t* m_pBase = nullptr;   // current frame base (synced at C boundaries)
     TValue_t* m_pTop = nullptr;    // first free slot (not maintained in frames)
     TValue_t* m_pMaxStack = nullptr;
@@ -266,11 +294,11 @@ static_assert(offsetof(C_GcTable, m_rGcList) == offsetof(C_GcFunction, m_rGcList
 // ---- frozen sizes (traces/handlers bake these offsets in) ------------------
 static_assert(core::IsFrozenLayout<C_GcString> && sizeof(C_GcString) == 20);
 static_assert(core::IsFrozenLayout<C_GcTable> && sizeof(C_GcTable) == 40);
-static_assert(core::IsFrozenLayout<C_GcProto> && sizeof(C_GcProto) == 40);
-static_assert(core::IsFrozenLayout<C_GcFunction> && sizeof(C_GcFunction) == 20);
+static_assert(core::IsFrozenLayout<C_GcProto> && sizeof(C_GcProto) == 48);
+static_assert(core::IsFrozenLayout<C_GcFunction> && sizeof(C_GcFunction) == 24);
 static_assert(core::IsFrozenLayout<C_GcUpvalue> && sizeof(C_GcUpvalue) == 24);
 static_assert(core::IsFrozenLayout<C_GcUserData> && sizeof(C_GcUserData) == 24);
-static_assert(core::IsFrozenLayout<C_LuaThread> && sizeof(C_LuaThread) == 72);
+static_assert(core::IsFrozenLayout<C_LuaThread> && sizeof(C_LuaThread) == 80);
 
 // ---- EGcObjectType ↔ EValueTag lockstep ------------------------------------
 // The dense object-type enum mirrors the value-tag complement order (LuaJIT's

@@ -1,0 +1,4 @@
+build/
+ljx
+ljx_test
+*.o

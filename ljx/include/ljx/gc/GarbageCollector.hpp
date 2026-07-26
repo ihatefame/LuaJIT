@@ -95,46 +95,54 @@ private:
 
 class C_GarbageCollector {
 public:
-    explicit C_GarbageCollector(vm::C_Universe& uni, core::C_SegregatedAllocator& alloc) noexcept;
+    C_GarbageCollector() noexcept = default;
+    void Init(vm::C_Universe& uni, core::C_SegregatedAllocator& alloc) noexcept;
 
     // --- allocation entry (inlined trigger: one compare) --------------------
     [[nodiscard]] LJX_FORCEINLINE bool NeedsStep() const noexcept {
-        return m_Stats.uTotalBytes >= m_Stats.uThreshold;
+        return m_pAllocatorPublic->TotalAllocated() >= m_Stats.uThreshold;
     }
-    void Step() noexcept;                       // one incremental quantum
-    void StepFromTrace(std::uint32_t uSteps) noexcept;  // may force a trace exit
-    void FullCollection() noexcept;
-    void SetMode(EGcMode eMode) noexcept;
+    // v1 collector is a precise stop-the-world mark-sweep invoked ONLY from
+    // interpreter safe points (function entry / allocation ops with a synced
+    // stack top). The incremental/generational engine replaces Step()'s body
+    // without changing any call site.
+    void Step() noexcept { CollectNow(); }
+    void CollectNow() noexcept;
+    void FullCollection() noexcept { CollectNow(); }
+    void SetMode(EGcMode eMode) noexcept { m_eMode = eMode; }
 
-    // --- write barriers (hot; must stay branch-minimal) ---------------------
-    // Tables: back barrier — blacken→gray-again, re-traversed once in atomic.
-    LJX_FORCEINLINE void BarrierBackTable(vm::C_GcTable* pTable) noexcept;
-    // Everything else: forward barrier (marks target, or whitens source
-    // outside propagate/atomic).
-    void BarrierForward(vm::GcHeader_t* pSource, const vm::GcHeader_t* pTarget) noexcept;
-    // Closed-upvalue store barrier (value-pointer form for handler use).
-    void BarrierUpvalue(vm::C_GcUpvalue* pUpval, const vm::TValue_t& tvStored) noexcept;
+    // --- write barriers -----------------------------------------------------
+    // v1 stop-the-world: no mutation can interleave marking, so all barriers
+    // are no-ops. The declarations (and every call site the interpreter
+    // plants) are the real deliverable — the incremental collector fills the
+    // bodies in without touching handlers.
+    LJX_FORCEINLINE void BarrierBackTable(vm::C_GcTable*) noexcept {}
+    LJX_FORCEINLINE void BarrierForward(vm::GcHeader_t*, const vm::GcHeader_t*) noexcept {}
+    LJX_FORCEINLINE void BarrierUpvalue(vm::C_GcUpvalue*, const vm::TValue_t&) noexcept {}
 
     // --- object lifecycle ---------------------------------------------------
+    // Allocates + links the object into the all-objects list (non-strings).
     [[nodiscard]] void* AllocObject(vm::EGcObjectType eType, std::size_t uBytes);
     void FixObject(vm::GcHeader_t* pHeader) noexcept;   // pin (never collected)
-
-    // --- finalization -------------------------------------------------------
-    void RegisterFinalizer(vm::GcHeader_t* pObject) noexcept;
-    void RunPendingFinalizers() noexcept;               // scheduled, budgeted
 
     [[nodiscard]] const GcStats_t& Stats() const noexcept { return m_Stats; }
     [[nodiscard]] EGcState State() const noexcept { return m_eState; }
 
 private:
-    // Gray chains: threaded through the objects' m_rGcList field (intrusive,
-    // allocation-free pushes — the barrier fast-path budget depends on this).
-    core::GcRef_t m_rGrayHead;
-    core::GcRef_t m_rGrayAgainHead;   // tables gone back-gray (≡ remembered set)
+    void MarkValue(const vm::TValue_t& tvValue) noexcept;
+    void MarkObject(vm::GcHeader_t* pHeader) noexcept;
+    void TraverseGrays() noexcept;
+    void SweepObjects() noexcept;
+    [[nodiscard]] std::size_t ObjectSize(const vm::GcHeader_t* pHeader) const noexcept;
+
+    vm::C_Universe* m_pUniverse = nullptr;
+    core::C_SegregatedAllocator* m_pAllocatorPublic = nullptr;
+    core::GcRef_t m_rAllObjects;      // every non-string GC object (v1 sweep list)
+    vm::GcHeader_t** m_pGrayStack = nullptr;   // collector-internal scratch
+    std::size_t m_uGrayCount = 0, m_uGrayCapacity = 0;
     GcStats_t m_Stats{};
     EGcState m_eState = EGcState::Pause;
     EGcMode m_eMode = EGcMode::Incremental;
-    std::uint8_t m_uCurrentWhite = 0;
 };
 
 }  // namespace ljx::gc

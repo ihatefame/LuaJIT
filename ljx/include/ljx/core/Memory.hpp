@@ -48,12 +48,12 @@ private:
 // Compressed references.
 //
 // GcRef_t / MRef_t are 32-bit GRANULE indices from the owning universe's
-// arena base: every referenced address is 16-byte aligned (the GC allocation
-// granule; vector blocks are likewise 16-aligned), so a 32-bit index scaled
-// by kCompressedRefShift addresses 2^36 bytes = 64 GB of arena — which is why
-// kMaxArenaReserve below caps C_VirtualArena reservations. The scaled add is
-// still a single addressing-mode operand on both ISAs ([base + idx*16] on
-// x86-64; ADD extended-register with LSL #4 on AArch64).
+// arena base. The granule is 8 bytes: MRefs must be able to reference any
+// TValue-aligned location (stack slots, proto constant areas), so a 32-bit
+// index scaled by kCompressedRefShift addresses 2^35 bytes = 32 GB of arena —
+// which is why kMaxArenaReserve below caps C_VirtualArena reservations. The
+// scaled add is a single addressing-mode operand on both ISAs ([base + idx*8]
+// on x86-64; ADD extended-register with LSL #3 on AArch64).
 //
 // Refs appear inside GC objects (headers, table nodes, proto constants…)
 // where density matters; TValue_t payloads still carry full 47-bit pointers
@@ -63,9 +63,9 @@ private:
 // base, passed explicitly (kept in the pinned context register at runtime).
 // ---------------------------------------------------------------------------
 
-inline constexpr unsigned kCompressedRefShift = 4;   // 16-byte referent alignment
+inline constexpr unsigned kCompressedRefShift = 3;   // 8-byte referent alignment
 inline constexpr std::size_t kMaxArenaReserve =
-    (std::size_t{1} << (32 + kCompressedRefShift));  // 64 GB: the ref-width contract
+    (std::size_t{1} << (32 + kCompressedRefShift));  // 32 GB: the ref-width contract
 
 struct GcRef_t {
     std::uint32_t uIndex = 0;   // granule index, not a byte offset
@@ -89,7 +89,7 @@ static_assert(IsFrozenLayout<MRef_t> && sizeof(MRef_t) == 4);
         uArenaBase + (std::uintptr_t{rRef.uIndex} << kCompressedRefShift));
 }
 
-// Precondition: pPtr is 16-byte aligned and within kMaxArenaReserve of the
+// Precondition: pPtr is 8-byte aligned and within kMaxArenaReserve of the
 // base (debug builds assert both; release builds rely on the allocator).
 [[nodiscard]] LJX_FORCEINLINE MRef_t PtrToRef(std::uintptr_t uArenaBase, const void* pPtr) noexcept {
     return MRef_t{static_cast<std::uint32_t>(
@@ -108,6 +108,8 @@ static_assert(IsFrozenLayout<MRef_t> && sizeof(MRef_t) == 4);
 
 class C_SegregatedAllocator {
 public:
+    static constexpr std::size_t kMaxSmallClass = 4096;
+
     explicit C_SegregatedAllocator(C_VirtualArena& arena) noexcept : m_pArena(&arena) {}
 
     [[nodiscard]] void* AllocGcObject(std::size_t uBytes) noexcept;   // bump path
@@ -118,9 +120,18 @@ public:
 
     [[nodiscard]] GcSize_t TotalAllocated() const noexcept { return m_uTotal; }
 
+    // Universe bootstrap: the allocator object is copied into the arena it
+    // manages and must then point at the arena's final home.
+    void RebindArena(C_VirtualArena& arena) noexcept { m_pArena = &arena; }
+
 private:
+    [[nodiscard]] void* AllocRaw(std::size_t uBytes) noexcept;
+
     C_VirtualArena* m_pArena;
     GcSize_t m_uTotal = 0;
+    std::uint8_t* m_pBumpCursor = nullptr;
+    std::uint8_t* m_pBumpLimit = nullptr;
+    void* m_vFreeLists[(kMaxSmallClass >> 4) + 1]{};
 };
 
 }  // namespace ljx::core

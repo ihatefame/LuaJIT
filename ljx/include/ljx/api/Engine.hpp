@@ -27,7 +27,7 @@ enum class EJitMode : std::uint8_t { Off, On, Flush };
 class C_LuaEngine {
 public:
     struct Options_t {
-        // Capped by core::kMaxArenaReserve (64 GB): the 32-bit granule-scaled
+        // Capped by core::kMaxArenaReserve (32 GB): the 32-bit granule-scaled
         // compressed-ref width is a hard contract (core/Memory.hpp).
         std::size_t uArenaReserveBytes = core::kMaxArenaReserve;
         bool bJitEnabled = true;

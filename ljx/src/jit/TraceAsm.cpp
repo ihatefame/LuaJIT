@@ -89,6 +89,11 @@ public:
 
     [[nodiscard]] bool Run();
 
+private:
+    [[nodiscard]] bool RunOnce();
+
+public:
+
     X64Emitter m_Emit;
     std::vector<PendingExit_t> m_vExits;
 
@@ -137,6 +142,9 @@ private:
     std::vector<std::uint8_t> m_vSpilled;
     std::vector<std::uint8_t> m_vNoSpill;
     std::vector<std::uint8_t> m_vInvariant;
+    // Pre-roll values that must live in memory for the whole loop (see Run()).
+    std::vector<std::uint8_t> m_vMemOnly;
+    bool m_bNewMemOnly = false;
     std::uint32_t m_vGprOwner[16]{};        // IR index + 1, 0 = free
     std::uint32_t m_vXmmOwner[16]{};
     std::uint32_t m_uGprPinned = 0;
@@ -228,6 +236,7 @@ void C_TraceAsm::ComputeLiveness() {
     m_vReg.assign(uCount, kNoReg);
     m_vSpilled.assign(uCount, 0);
     m_vNoSpill.assign(uCount, 0);
+    if (m_vMemOnly.size() != uCount) m_vMemOnly.assign(uCount, 0);
     const auto uEnd = static_cast<std::uint32_t>(m_vOrder.size());
 
     auto Use = [&](IrRef r, std::uint32_t uPos) {
@@ -321,6 +330,15 @@ bool C_TraceAsm::Allocate(std::size_t uIdx, bool bFloat, std::uint8_t& uOut) {
     }
     if (uVictim == kNoReg) { m_bFailed = true; uOut = kNoReg; return false; }
     const std::size_t uOwn = pOwner[uVictim] - 1;
+    // Evicting a value DEFINED IN THE PRE-ROLL is not something this pass can
+    // express. Its uses earlier in the linear order run AFTER this point on
+    // every iteration but the first, and they would still read the register we
+    // are handing away. Record it and let Run() retry with that value pinned to
+    // memory for the whole loop.
+    if (m_vInvariant[uOwn] && m_vIns[uOwn].eOp != EIrOp::SLoad && !m_vMemOnly[uOwn]) {
+        m_vMemOnly[uOwn] = 1;
+        m_bNewMemOnly = true;
+    }
     // A value whose home slot is already written needs no store here — and
     // MUST not get one: the eviction point is inside the loop body, so on the
     // next iteration the register holds something else and the store would
@@ -354,6 +372,10 @@ std::uint8_t C_TraceAsm::OperandGpr(IrRef r, int nScratch) {
         return kGprScratch[nScratch];
     }
     const std::size_t uI = r - kIrBias;
+    if (m_vMemOnly[uI]) {
+        m_Emit.MovLoadR64(kGprScratch[nScratch], kRsp, SpillDisp(uI));
+        return kGprScratch[nScratch];
+    }
     if (m_vReg[uI] != kNoReg) { Pin(m_vReg[uI], false); return m_vReg[uI]; }
     std::uint8_t uReg = kNoReg;
     if (!Allocate(uI, false, uReg)) return kGprScratch[nScratch];
@@ -368,6 +390,10 @@ std::uint8_t C_TraceAsm::OperandXmm(IrRef r, int nScratch) {
         return kXmmScratch[nScratch];
     }
     const std::size_t uI = r - kIrBias;
+    if (m_vMemOnly[uI]) {
+        m_Emit.MovsdLoad(kXmmScratch[nScratch], kRsp, SpillDisp(uI));
+        return kXmmScratch[nScratch];
+    }
     if (m_vReg[uI] != kNoReg) { Pin(m_vReg[uI], true); return m_vReg[uI]; }
     std::uint8_t uReg = kNoReg;
     if (!Allocate(uI, true, uReg)) return kXmmScratch[nScratch];
@@ -723,7 +749,7 @@ void C_TraceAsm::EmitBackEdge() {
     if (uRemaining) m_bFailed = true;
 }
 
-bool C_TraceAsm::Run() {
+bool C_TraceAsm::RunOnce() {
     if (m_vIns.empty()) return false;
     ComputeLiveness();
     const std::size_t uFrame = ((m_vIns.size() * 8 + 15) & ~std::size_t{15}) + 8;
@@ -757,6 +783,12 @@ bool C_TraceAsm::Run() {
             else
                 m_Emit.MovStoreR64(m_vReg[uI], kRsp, SpillDisp(uI));
             m_vSpilled[uI] = 1;
+            // Memory-resident for the loop's duration: hand the register back
+            // now instead of letting the body evict it and break iteration 2.
+            if (m_vMemOnly[uI]) {
+                (IsFloatType(m_vIns[uI].eType) ? m_vXmmOwner : m_vGprOwner)[m_vReg[uI]] = 0;
+                m_vReg[uI] = kNoReg;
+            }
         }
     }
     if (!bAtLoopTop) m_uLoopTop = m_Emit.Here();
@@ -795,6 +827,27 @@ bool C_TraceAsm::Run() {
     m_Emit.PopR64(12); m_Emit.PopR64(5); m_Emit.PopR64(3);
     m_Emit.Ret();
     return true;
+}
+
+// Allocation is a fixed point, not a single pass: a pre-roll value the body
+// evicts has to be demoted to memory and everything re-emitted, because that
+// eviction is not expressible in a linear scan over a loop. Each retry can only
+// demote more values, so this terminates.
+bool C_TraceAsm::Run() {
+    for (std::uint32_t uAttempt = 0; uAttempt < 8; ++uAttempt) {
+        m_Emit = X64Emitter{};
+        m_vExits.clear();
+        std::memset(m_vGprOwner, 0, sizeof m_vGprOwner);
+        std::memset(m_vXmmOwner, 0, sizeof m_vXmmOwner);
+        m_uGprPinned = m_uXmmPinned = 0;
+        m_uLoopTop = m_uHoisted = 0;
+        m_vOrder.clear();
+        m_bFailed = false;
+        m_bNewMemOnly = false;
+        const bool bOk = RunOnce();
+        if (!m_bNewMemOnly) return bOk;
+    }
+    return false;
 }
 
 }  // namespace

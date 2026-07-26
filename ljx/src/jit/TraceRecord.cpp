@@ -300,6 +300,79 @@ void C_TraceJit::AbortRecording(EAbort eReason, const char* sDetail) {
     vm::C_Interpreter::SetRecordMode(*m_pUniverse, false);
 }
 
+// A snapshot taken BEFORE a slot's first read does not mention that slot,
+// because at that point in the recorded iteration nothing had touched it. For
+// one straight-line iteration that is correct — the Lua stack still holds the
+// entry value. For a LOOP it is not: the slot is carried in a register that
+// the back edge keeps current, so after N iterations the stack copy is N
+// iterations stale, and an exit through such a snapshot resumes the
+// interpreter at an old index.
+//
+// So once the loop is closed and the full set of loop-carried slots is known,
+// every snapshot is refilled with the ones it lacks, naming the ENTRY load —
+// which is exactly the register holding that slot's value at the loop top.
+// Snapshot 0 is left alone: it is the entry exit, taken before the preamble
+// has loaded anything.
+void C_TraceJit::FinalizeSnapshots() {
+    std::vector<SnapSlot_t> vNew;
+    vNew.reserve(m_vSnapSlots.size() * 2);
+    for (std::size_t uS = 0; uS < m_vSnapshots.size(); ++uS) {
+        Snapshot_t& snap = m_vSnapshots[uS];
+        const auto uFirst = static_cast<std::uint32_t>(vNew.size());
+        for (std::uint32_t uI = 0; uI < snap.uSlotCount; ++uI)
+            vNew.push_back(m_vSnapSlots[snap.uFirstSlot + uI]);
+        if (uS != 0) {
+            for (std::size_t uSlot = 0; uSlot < m_vSlotEntry.size(); ++uSlot) {
+                if (m_vSlotEntry[uSlot] == kIrNone) continue;
+                bool bPresent = false;
+                for (std::uint32_t uI = 0; uI < snap.uSlotCount; ++uI)
+                    if (m_vSnapSlots[snap.uFirstSlot + uI].nSlot ==
+                        static_cast<std::int32_t>(uSlot) - kSlotBias)
+                        bPresent = true;
+                if (bPresent) continue;
+                vNew.push_back(SnapSlot_t{static_cast<std::int32_t>(uSlot) - kSlotBias,
+                                          m_vSlotEntry[uSlot]});
+            }
+        }
+        snap.uFirstSlot = uFirst;
+        snap.uSlotCount = static_cast<std::uint32_t>(vNew.size()) - uFirst;
+    }
+    m_vSnapSlots = std::move(vNew);
+}
+
+// Human-readable IR listing (LJX_TRACEIR=1). Constants print as ~N, the slot
+// map as the entry/exit pair per slot.
+void C_TraceJit::DumpIr() const {
+    std::fprintf(stderr, "---- trace IR (%zu ins, %zu const) ----\n", m_vIns.size(),
+                 m_vConst.size());
+    for (std::size_t uI = 0; uI < m_vIns.size(); ++uI) {
+        const IrIns_t& ins = m_vIns[uI];
+        std::fprintf(stderr, "%4zu %-10s t%u ", uI, IrOpName(ins.eOp),
+                     static_cast<unsigned>(ins.eType));
+        for (int nK = 0; nK < 2; ++nK) {
+            const IrRef r = nK == 0 ? ins.rOp1 : ins.rOp2;
+            if (r == kIrNone) continue;
+            if (ins.eOp == EIrOp::SLoad || ins.eOp == EIrOp::SStore) {
+                if (nK == 0) { std::fprintf(stderr, "slot%d ", static_cast<int>(r) - kSlotBias); continue; }
+            }
+            if (IsConstRef(r))
+                std::fprintf(stderr, "K%lld(0x%llx) ",
+                             static_cast<long long>(kIrBias - 1 - r),
+                             static_cast<unsigned long long>(m_vConst[kIrBias - 1 - r].uValue));
+            else
+                std::fprintf(stderr, "%zu ", static_cast<std::size_t>(r - kIrBias));
+        }
+        if (m_vInsSnap[uI] != 0xffff) std::fprintf(stderr, " [snap %u]", m_vInsSnap[uI]);
+        std::fprintf(stderr, "\n");
+    }
+    for (std::size_t uS = 0; uS < m_vSlotValue.size(); ++uS)
+        if (m_vSlotValue[uS] != kIrNone || m_vSlotEntry[uS] != kIrNone)
+            std::fprintf(stderr, "  slot%-4d entry=%d value=%d\n",
+                         static_cast<int>(uS) - kSlotBias,
+                         m_vSlotEntry[uS] ? m_vSlotEntry[uS] - kIrBias : -1,
+                         m_vSlotValue[uS] ? m_vSlotValue[uS] - kIrBias : -1);
+}
+
 void C_TraceJit::CloseLoop() {
     if (!m_vFrames.empty() || m_nBaseOffset != 0) {
         AbortRecording(EAbort::LeftFrame, "loop closed in an inlined frame");
@@ -316,6 +389,8 @@ void C_TraceJit::CloseLoop() {
             (void)Emit(EIrOp::SStore, TypeOf(m_vSlotValue[uI]), static_cast<IrRef>(uI),
                        m_vSlotValue[uI]);
     (void)Emit(EIrOp::Loop, EIrType::Nothing, kIrNone, kIrNone);
+    FinalizeSnapshots();
+    if (std::getenv("LJX_TRACEIR")) DumpIr();
     Trace_t* pTrace = Assemble();
     m_eState = ETraceState::Idle;
     vm::C_Interpreter::SetRecordMode(*m_pUniverse, false);
@@ -340,9 +415,14 @@ const Trace_t* C_TraceJit::OnLoopEdge(const BcIns_t* pHeadPc, TValue_t* pBase,
     static const bool bDisabled = std::getenv("LJX_NOJIT") != nullptr;
     if (bDisabled || m_eState == ETraceState::Recording) return nullptr;
     if (auto it = m_mapTraces.find(pHeadPc); it != m_mapTraces.end()) return it->second;
-    std::uint32_t& uCount = m_mapHot[pHeadPc];
-    if (uCount >= kBlacklistCount) return nullptr;
-    if (++uCount < kHotLoopThreshold) return nullptr;
+    // The caller only gets here when the hashed hot counter BORROWED, which
+    // already means kHotLoopThreshold iterations of this back edge. Counting
+    // again here would multiply the two thresholds together — 56 x 53 ~ 3000
+    // iterations before a trace is even attempted, which is more than most
+    // real loops ever run. This map is the blacklist, not a second counter.
+    if (const auto it = m_mapHot.find(pHeadPc);
+        it != m_mapHot.end() && it->second >= kBlacklistCount)
+        return nullptr;
     StartRecording(pHeadPc, pBase, pKBase);
     return nullptr;
 }

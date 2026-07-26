@@ -96,6 +96,8 @@ private:
                         const vm::TValue_t* pKBase);
     void AbortRecording(EAbort eReason, const char* sDetail);
     void CloseLoop();
+    void DumpIr() const;
+    void FinalizeSnapshots();
     [[nodiscard]] bool RecordOne(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
 
     [[nodiscard]] IrRef SlotRef(std::int32_t nSlot);          // load-on-demand + guard

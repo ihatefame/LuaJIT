@@ -1068,8 +1068,12 @@ LJX_NOINLINE TraceResume_t RunTrace(const jit::Trace_t* pTrace, TValue_t* pBase,
         if (pStats->vExitCounts.size() <= uExit) pStats->vExitCounts.resize(uExit + 1);
         ++pStats->vExitCounts[uExit];
         if (pStats->uEntries < 12)
-            std::fprintf(stderr, "[trace] #%u entry %llu -> exit %u\n", pTrace->uNumber,
-                         static_cast<unsigned long long>(pStats->uEntries), uExit);
+            std::fprintf(stderr, "[trace] #%u entry %llu -> exit %u, resume %s @%p base%+d\n",
+                         pTrace->uNumber,
+                         static_cast<unsigned long long>(pStats->uEntries), uExit,
+                         OpName(pTrace->vExits[uExit].pResumePc->Op()),
+                         static_cast<const void*>(pTrace->vExits[uExit].pResumePc),
+                         pTrace->vExits[uExit].nBaseOffset);
     }
     C_LuaThread* pThread = pUni->MainThread();
     TValue_t* pReach = pBase + pTrace->nTopSlot + 1;

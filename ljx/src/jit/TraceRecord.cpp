@@ -146,6 +146,17 @@ TValue_t C_TraceJit::ConstValue(IrRef rRef) const noexcept {
 
 IrRef C_TraceJit::Emit(EIrOp eOp, EIrType eType, IrRef rOp1, IrRef rOp2) {
     if (m_eState != ETraceState::Recording) return kIrNone;
+    // Store-to-load forwarding: a load from the address of a tracked store
+    // returns the stored value — no load, and no type guard, because the
+    // value's type is known statically. The observed runtime value IS the
+    // stored one, so a type mismatch just means "don't forward".
+    if (eOp == EIrOp::LoadTV) {
+        for (const auto& fwd : m_vStoreFwd)
+            if (fwd.first == rOp1) {
+                if (TypeOf(fwd.second) == eType) return fwd.second;
+                break;
+            }
+    }
     // Common-subexpression elimination over this opcode's chain. Operands are
     // always defined before their use, so the walk is bounded by the newer of
     // the two operand refs — anything older cannot match.
@@ -169,12 +180,44 @@ IrRef C_TraceJit::Emit(EIrOp eOp, EIrType eType, IrRef rOp1, IrRef rOp2) {
     m_vIntegral.push_back(0);
     m_vForceHoist.push_back(0);
     m_vChain[static_cast<std::size_t>(eOp)] = rNew;
-    // A store invalidates the load chains: a later load must not be forwarded
-    // across it. Truncating the chain is the whole alias analysis.
-    if (eOp == EIrOp::StoreTV || eOp == EIrOp::SStore || eOp == EIrOp::CallSetNew ||
-        eOp == EIrOp::CallSetNewK) {
+    // A store invalidates the load chains: a later load must not be CSE'd
+    // across it. Truncating the chain is the whole alias analysis. Value
+    // stores (StoreTV to slots, SStore to the Lua stack) can only alias
+    // LoadTV — no u32 header field lives in a TValue slot — while the
+    // key-creating helpers can move whole node arrays and kill both.
+    if (eOp == EIrOp::StoreTV || eOp == EIrOp::SStore) {
+        m_vChain[static_cast<std::size_t>(EIrOp::LoadTV)] = kIrNone;
+    } else if (eOp == EIrOp::CallSetNew || eOp == EIrOp::CallSetNewK ||
+               eOp == EIrOp::CallC) {
+        // CallC included: a whitelisted builtin may mutate a table
+        // (table.insert) and resize it.
         m_vChain[static_cast<std::size_t>(EIrOp::LoadTV)] = kIrNone;
         m_vChain[static_cast<std::size_t>(EIrOp::LoadU32)] = kIrNone;
+    }
+    // Forwarding state. A new store drops every tracked entry it may alias;
+    // the one proof of distinctness is two node addresses whose key guards
+    // pin DIFFERENT keys in the SAME table — same runtime address would make
+    // those guards unsatisfiable together. Helper calls can move node arrays
+    // (or run arbitrary code), so they forget everything.
+    if (eOp == EIrOp::StoreTV) {
+        const auto itNew = m_mapNodeAlias.find(rOp1);
+        std::erase_if(m_vStoreFwd, [&](const std::pair<IrRef, IrRef>& e) {
+            if (e.first == rOp1) return true;   // superseded by this store
+            // Two distinct CONSTANT slot addresses never alias (interned
+            // constants: distinct refs = distinct pointers).
+            if (IsConstRef(e.first) && IsConstRef(rOp1)) return false;
+            if (itNew == m_mapNodeAlias.end()) return true;
+            const auto itOld = m_mapNodeAlias.find(e.first);
+            return itOld == m_mapNodeAlias.end() ||
+                   itOld->second.rTab != itNew->second.rTab ||
+                   itOld->second.uKeyRaw == itNew->second.uKeyRaw;
+        });
+        m_vStoreFwd.emplace_back(rOp1, rOp2);
+    } else if (eOp == EIrOp::CallNewTab || eOp == EIrOp::CallSetNew ||
+               eOp == EIrOp::CallSetNewK || eOp == EIrOp::CallCat ||
+               eOp == EIrOp::CallLen || eOp == EIrOp::CallNewFunc ||
+               eOp == EIrOp::CallC || eOp == EIrOp::CallIter) {
+        m_vStoreFwd.clear();
     }
     return rNew;
 }
@@ -385,6 +428,8 @@ void C_TraceJit::StartRecording(const BcIns_t* pPc, TValue_t* pBase, const TValu
     m_vSnapshots.clear();
     m_vSnapSlots.clear();
     m_vFrames.clear();
+    m_vStoreFwd.clear();
+    m_mapNodeAlias.clear();
     std::memset(m_vChain, 0, sizeof m_vChain);
     m_vSlotValue.assign(static_cast<std::size_t>(kMaxSlot + kSlotBias), kIrNone);
     m_vSlotEntry.assign(static_cast<std::size_t>(kMaxSlot + kSlotBias), kIrNone);
@@ -1228,7 +1273,9 @@ IrRef C_TraceJit::HashNodeRef(IrRef rTabPtr, const C_GcTable* pTab, TValue_t tvK
                                         kIrNone);
             if (pNode->tvKey == tvKey) {
                 (void)EmitGuard(EIrOp::GuardEq, rNodeKey, Materialize(rKeyConst), pResumePc);
-                return m_eState == ETraceState::Recording ? rNode : kIrNone;
+                if (m_eState != ETraceState::Recording) return kIrNone;
+                m_mapNodeAlias[rNode] = NodeAlias_t{rTabPtr, tvKey.uRaw};
+                return rNode;
             }
             (void)EmitGuard(EIrOp::GuardNe, rNodeKey, Materialize(rKeyConst), pResumePc);
             if (m_eState != ETraceState::Recording) return kIrNone;
@@ -1292,7 +1339,12 @@ IrRef C_TraceJit::HashNodeRef(IrRef rTabPtr, const C_GcTable* pTab, TValue_t tvK
                                     kIrNone);
         if (pNode->tvKey == tvKey) {
             (void)EmitGuard(EIrOp::GuardEq, rNodeKey, Materialize(rKeyTagged), pResumePc);
-            return m_eState == ETraceState::Recording ? rNode : kIrNone;
+            if (m_eState != ETraceState::Recording) return kIrNone;
+            // The alias proof only holds for a key pinned to ONE value —
+            // a runtime key ref matches many strings, so it stays unproven.
+            if (rKeyRef == kIrNone || IsConstRef(rKeyRef))
+                m_mapNodeAlias[rNode] = NodeAlias_t{rTabPtr, tvKey.uRaw};
+            return rNode;
         }
         (void)EmitGuard(EIrOp::GuardNe, rNodeKey, Materialize(rKeyTagged), pResumePc);
         if (m_eState != ETraceState::Recording) return kIrNone;

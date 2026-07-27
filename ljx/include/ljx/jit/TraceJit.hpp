@@ -231,6 +231,15 @@ private:
     std::vector<Snapshot_t> m_vSnapshots;
     std::vector<SnapSlot_t> m_vSnapSlots;
     IrRef m_vChain[static_cast<std::size_t>(EIrOp::Count_)]{};   // CSE chains
+    // Store-to-load forwarding: the value last StoreTV'd to each address ref.
+    // Aliasing is decided by m_mapNodeAlias — a node address whose key guard
+    // pins a different key in the same table provably cannot alias.
+    std::vector<std::pair<IrRef, IrRef>> m_vStoreFwd;
+    struct NodeAlias_t {
+        IrRef rTab;
+        std::uint64_t uKeyRaw;
+    };
+    std::unordered_map<IrRef, NodeAlias_t> m_mapNodeAlias;
     std::vector<IrRef> m_vSlotValue;                // slot -> current IR value
     std::vector<IrRef> m_vSlotEntry;                // slot -> entry SLoad (loop carried)
 

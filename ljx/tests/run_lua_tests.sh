@@ -63,6 +63,9 @@ check trace_pairs "$(printf '125250\t500\n20100\t201000\n0\t42\n100\n12600\n4515
 check vararg "$(printf '7\t7\n1\ttwo\t3\n0\t1\t3\n1\t2\t3\n9\tnil\t0\nb\tz\n377250\n3\n60\nfalse\tboom\n10\t20\t30\n5\t6\n15\np\tq\n2\t3')"
 # string.format: conversions, width/precision, %q length.
 check strformat "$(printf '42 -7    42 42   |\nff FF 10 7\n3.14 1.234568e+04 0.5\nhi        pad left      | A\n12.35%%\nx=1 y=true\n9')"
+# Store-to-load forwarding hazards: aliased tables, helper calls between
+# store and load, distinct-key and distinct-constant-address proofs.
+check trace_fwd "$(printf '133923\n2001000\n2001000\n0')"
 # Lua patterns: find/match/gmatch/gsub, classes, captures, %b, %f, backrefs.
 check strpattern "$(printf '7\t9\n2\t2\nkey\tvalue\n2026\t07\t27\n3\tone\tthree\na1\tb2\nhell0 w0rld\t2\n<hello> <world>\t2\nhe[ll]o\t1\nAB CD\t2\n<x\n3\t6\nX X X X\t4\naa\n4\t7\n5\t5\n,spaced,csv,x\t3\nfalse\tunfinished capture\n1')"
 # Differential test: compiled loops must produce byte-identical output to the

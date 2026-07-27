@@ -595,6 +595,26 @@ LJX_FORCEINLINE std::uint32_t FormatNumber(char* pOut, double flValue) noexcept 
 // Outside the anonymous namespace: the trace runtime helpers call this.
 LJX_NOINLINE C_GcString* CatSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_t* pPc,
                                  std::uint32_t uFirst, std::uint32_t uLast) {
+    // The dominant shape — one string, one integer ("key" .. i) — hits the
+    // universe's concat memo: same operands, same interned result. The cache
+    // is cleared at every GC sweep, so a stored pointer can never dangle.
+    std::int32_t nRightInt;
+    C_Universe::ConcatCacheEntry_t* pEntry = nullptr;
+    if (uLast == uFirst + 1 && pBase[uFirst].Is(EValueTag::String) &&
+        pBase[uLast].IsDouble() &&
+        core::NumToInt32Check(pBase[uLast].AsDouble(), nRightInt)) {
+        auto* pLeft = static_cast<C_GcString*>(pBase[uFirst].AsGcPointer());
+        const std::uint32_t uSlot =
+            ((pLeft->m_uSid * 2654435761u) ^ static_cast<std::uint32_t>(nRightInt)) &
+            (C_Universe::kConcatCacheSize - 1);
+        pEntry = &pUni->m_vConcatCache[uSlot];
+        if (pEntry->pResult && pEntry->uLeftSid == pLeft->m_uSid &&
+            pEntry->nRight == nRightInt)
+            return pEntry->pResult;
+        pEntry->uLeftSid = pLeft->m_uSid;
+        pEntry->nRight = nRightInt;
+        pEntry->pResult = nullptr;   // filled below
+    }
     // Stack buffer covers virtually all concatenations; spill to the heap
     // only for large results. No std::string on this path.
     char vStack[512];
@@ -631,6 +651,7 @@ LJX_NOINLINE C_GcString* CatSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_
     }
     C_GcString* pResult = pUni->Interner().Intern(std::string_view(pBuf, uLen));
     std::free(pHeap);
+    if (pEntry) pEntry->pResult = pResult;
     return pResult;
 }
 

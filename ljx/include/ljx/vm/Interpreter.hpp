@@ -286,6 +286,17 @@ public:
     const C_GcTable* m_pIterHintTab = nullptr;
     std::uint64_t m_uIterHintKey = 0;
     std::uint32_t m_uIterHintNode = 0;
+    // Direct-mapped memo for the dominant concat shape, `str .. int` — think
+    // "key" .. i. A hit skips the digit formatting, the hash and the intern
+    // chain walk. Entries hold raw string pointers, so the GC sweep clears
+    // the whole cache (strings may die between cycles; sids may be reused).
+    struct ConcatCacheEntry_t {
+        std::uint32_t uLeftSid = 0;
+        std::int32_t nRight = 0;
+        C_GcString* pResult = nullptr;   // nullptr = empty entry
+    };
+    static constexpr std::uint32_t kConcatCacheSize = 2048;   // power of two
+    ConcatCacheEntry_t m_vConcatCache[kConcatCacheSize];
     core::C_Prng m_Prng;
     // 8-aligned (MRef target): shared dispatch cell all C closures point at.
     BcIns_t m_insCFuncHeader;

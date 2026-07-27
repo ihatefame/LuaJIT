@@ -226,6 +226,8 @@ void C_GarbageCollector::CollectNow() noexcept {
     m_eState = EGcState::Sweep;
     uni.Interner().SweepAll();
     SweepObjects();
+    // Concat memo holds raw string pointers; anything may have died.
+    for (auto& entry : uni.m_vConcatCache) entry.pResult = nullptr;
 
     m_eState = EGcState::Pause;
     const core::GcSize_t uLive = m_pAllocatorPublic->TotalAllocated();

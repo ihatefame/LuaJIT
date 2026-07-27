@@ -61,6 +61,8 @@ check trace_pairs "$(printf '125250\t500\n20100\t201000\n0\t42\n100\n12600\n4515
 # Vararg functions: FuncV frame reshaping, VarG, select/unpack, tail-recursive
 # vararg calls (no stack leak), pcall across vararg frames.
 check vararg "$(printf '7\t7\n1\ttwo\t3\n0\t1\t3\n1\t2\t3\n9\tnil\t0\nb\tz\n377250\n3\n60\nfalse\tboom\n10\t20\t30\n5\t6\n15\np\tq\n2\t3')"
+# string.format: conversions, width/precision, %q length.
+check strformat "$(printf '42 -7    42 42   |\nff FF 10 7\n3.14 1.234568e+04 0.5\nhi        pad left      | A\n12.35%%\nx=1 y=true\n9')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
 # script in tests/lua is run both ways and the outputs compared. The poisoned

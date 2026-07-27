@@ -431,6 +431,107 @@ std::int32_t LibStringRep(lua_State* pState) {
     return 1;
 }
 
+std::int32_t LibStringFormat(lua_State* pState) {
+    C_GcString* pFmt = StrArg(pState, 0, "format");
+    C_Universe& uni = *Uni(pState);
+    const char* pC = pFmt->Data();
+    const char* pEnd = pC + pFmt->Length();
+    std::string sOut;
+    std::int32_t nArg = 1;
+    char vSpec[32];   // "%" + flags/width/precision + conversion
+    char vItem[256];
+    while (pC < pEnd) {
+        if (*pC != '%') {
+            sOut.push_back(*pC++);
+            continue;
+        }
+        ++pC;
+        if (pC < pEnd && *pC == '%') {
+            sOut.push_back('%');
+            ++pC;
+            continue;
+        }
+        // Collect flags, width and precision (bounded, snprintf does the rest).
+        std::size_t uSpec = 0;
+        vSpec[uSpec++] = '%';
+        while (pC < pEnd && std::strchr("-+ #0", *pC) && uSpec < 6) vSpec[uSpec++] = *pC++;
+        while (pC < pEnd && *pC >= '0' && *pC <= '9' && uSpec < 9) vSpec[uSpec++] = *pC++;
+        if (pC < pEnd && *pC == '.') {
+            vSpec[uSpec++] = *pC++;
+            while (pC < pEnd && *pC >= '0' && *pC <= '9' && uSpec < 13) vSpec[uSpec++] = *pC++;
+        }
+        if (pC >= pEnd) RaiseError(uni, "invalid format string to 'format'");
+        const char cConv = *pC++;
+        switch (cConv) {
+            case 'd': case 'i': {
+                const auto nValue =
+                    static_cast<long long>(NumArg(pState, nArg++, "format"));
+                vSpec[uSpec] = '\0';
+                std::snprintf(vItem, sizeof vItem,
+                              (std::string(vSpec) + "lld").c_str(), nValue);
+                sOut += vItem;
+                break;
+            }
+            case 'u': case 'x': case 'X': case 'o': {
+                const auto uValue = static_cast<unsigned long long>(
+                    static_cast<long long>(NumArg(pState, nArg++, "format")));
+                vSpec[uSpec] = '\0';
+                std::snprintf(vItem, sizeof vItem,
+                              (std::string(vSpec) + "ll" + cConv).c_str(), uValue);
+                sOut += vItem;
+                break;
+            }
+            case 'c': {
+                sOut.push_back(static_cast<char>(
+                    static_cast<int>(NumArg(pState, nArg++, "format"))));
+                break;
+            }
+            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+                vSpec[uSpec++] = cConv;
+                vSpec[uSpec] = '\0';
+                std::snprintf(vItem, sizeof vItem, vSpec,
+                              NumArg(pState, nArg++, "format"));
+                sOut += vItem;
+                break;
+            }
+            case 's': {
+                std::string sPart;
+                ToStringBuf(uni, Args(pState)[nArg++], sPart);
+                if (uSpec == 1) {
+                    sOut += sPart;   // plain %s: no copy through the buffer
+                } else {
+                    vSpec[uSpec++] = 's';
+                    vSpec[uSpec] = '\0';
+                    std::snprintf(vItem, sizeof vItem, vSpec, sPart.c_str());
+                    sOut += vItem;
+                }
+                break;
+            }
+            case 'q': {
+                C_GcString* pStr = StrArg(pState, nArg++, "format");
+                sOut.push_back('"');
+                for (std::uint32_t uI = 0; uI < pStr->Length(); ++uI) {
+                    const char c = pStr->Data()[uI];
+                    switch (c) {
+                        case '"': sOut += "\\\""; break;
+                        case '\\': sOut += "\\\\"; break;
+                        case '\n': sOut += "\\\n"; break;
+                        case '\r': sOut += "\\r"; break;
+                        case '\0': sOut += "\\0"; break;
+                        default: sOut.push_back(c); break;
+                    }
+                }
+                sOut.push_back('"');
+                break;
+            }
+            default:
+                RaiseError(uni, "invalid option '%%%c' to 'format'", cConv);
+        }
+    }
+    Args(pState)[0] = TValue_t::GcObject(EValueTag::String, uni.Interner().Intern(sOut));
+    return 1;
+}
+
 std::int32_t LibStringByte(lua_State* pState) {
     C_GcString* pStr = StrArg(pState, 0, "byte");
     const std::int64_t nIdx =
@@ -625,6 +726,7 @@ void OpenStdLib(C_Universe& uni) {
     SetField(uni, pGlobals, "string", TValue_t::GcObject(EValueTag::Table, pString));
     RegisterFn(uni, pString, "len", &LibStringLen, EFastFunc::StringLen);
     RegisterFn(uni, pString, "sub", &LibStringSub, EFastFunc::StringSub);
+    RegisterFn(uni, pString, "format", &LibStringFormat);
     RegisterFn(uni, pString, "rep", &LibStringRep);
     RegisterFn(uni, pString, "byte", &LibStringByte);
     RegisterFn(uni, pString, "char", &LibStringChar, EFastFunc::StringChar);

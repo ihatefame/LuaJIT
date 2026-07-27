@@ -13,6 +13,7 @@
 #include "ljx/gc/GarbageCollector.hpp"
 #include "ljx/vm/FastFunc.hpp"
 #include "ljx/rt/Meta.hpp"
+#include "ljx/rt/Pattern.hpp"
 #include "ljx/rt/StringInterner.hpp"
 #include "ljx/vm/Interpreter.hpp"
 
@@ -431,6 +432,252 @@ std::int32_t LibStringRep(lua_State* pState) {
     return 1;
 }
 
+// --- string patterns --------------------------------------------------------
+
+// One capture as a Lua value; uIdx == level with level 0 means "whole match".
+TValue_t CaptureValue(lua_State* pState, rt::C_PatternMatcher& matcher,
+                      std::uint32_t uIdx, const char* pSrcInit, const char* pMatchS,
+                      const char* pMatchE) {
+    if (uIdx >= matcher.m_uLevel) {
+        return TValue_t::GcObject(
+            EValueTag::String,
+            Uni(pState)->Interner().Intern(
+                std::string_view(pMatchS, static_cast<std::size_t>(pMatchE - pMatchS))));
+    }
+    const rt::MatchCapture_t& cap = matcher.m_vCapture[uIdx];
+    if (cap.nLen == rt::kCapUnfinished)
+        RaiseError(*Uni(pState), "unfinished capture");
+    if (cap.nLen == rt::kCapPosition)
+        return TValue_t::Number(static_cast<double>(cap.pInit - pSrcInit + 1));
+    return TValue_t::GcObject(
+        EValueTag::String,
+        Uni(pState)->Interner().Intern(
+            std::string_view(cap.pInit, static_cast<std::size_t>(cap.nLen))));
+}
+
+// Write the captures (or the whole match) to pOut; returns the value count.
+std::int32_t PushCaptures(lua_State* pState, rt::C_PatternMatcher& matcher,
+                          const char* pSrcInit, const char* pMatchS, const char* pMatchE,
+                          TValue_t* pOut) {
+    const std::uint32_t uCount = matcher.m_uLevel ? matcher.m_uLevel : 1;
+    for (std::uint32_t uI = 0; uI < uCount; ++uI)
+        pOut[uI] = CaptureValue(pState, matcher, matcher.m_uLevel ? uI : 1,
+                                pSrcInit, pMatchS, pMatchE);
+    return static_cast<std::int32_t>(uCount);
+}
+
+// Clamped 1-based init argument -> byte offset.
+std::size_t PatternInit(lua_State* pState, std::int32_t nArg, std::size_t uLen) {
+    if (ArgCount(pState) <= nArg || Args(pState)[nArg].IsNil()) return 0;
+    auto nInit = static_cast<std::int64_t>(NumArg(pState, nArg, "find"));
+    if (nInit > 0) return static_cast<std::size_t>(nInit - 1) > uLen
+                              ? uLen
+                              : static_cast<std::size_t>(nInit - 1);
+    if (nInit == 0) return 0;
+    const auto nFromEnd = static_cast<std::int64_t>(uLen) + nInit;
+    return nFromEnd < 0 ? 0 : static_cast<std::size_t>(nFromEnd);
+}
+
+std::int32_t StringFindCommon(lua_State* pState, bool bFind) {
+    C_GcString* pSrc = StrArg(pState, 0, "find");
+    C_GcString* pPat = StrArg(pState, 1, "find");
+    const char* pS = pSrc->Data();
+    const std::size_t uSLen = pSrc->Length();
+    const char* pP = pPat->Data();
+    const std::size_t uPLen = pPat->Length();
+    const std::size_t uInit = PatternInit(pState, 2, uSLen);
+    C_Universe& uni = *Uni(pState);
+
+    if (bFind && ArgCount(pState) > 3 && Args(pState)[3].IsTruthy()) {
+        // Plain find: raw substring search, no pattern meaning at all.
+        if (uPLen == 0) {
+            Args(pState)[0] = TValue_t::Number(static_cast<double>(uInit + 1));
+            Args(pState)[1] = TValue_t::Number(static_cast<double>(uInit));
+            return 2;
+        }
+        for (std::size_t uI = uInit; uI + uPLen <= uSLen; ++uI) {
+            if (std::memcmp(pS + uI, pP, uPLen) == 0) {
+                Args(pState)[0] = TValue_t::Number(static_cast<double>(uI + 1));
+                Args(pState)[1] = TValue_t::Number(static_cast<double>(uI + uPLen));
+                return 2;
+            }
+        }
+        Args(pState)[0] = TValue_t::Nil();
+        return 1;
+    }
+
+    const bool bAnchor = uPLen > 0 && *pP == '^';
+    const char* pPatStart = pP + (bAnchor ? 1 : 0);
+    rt::C_PatternMatcher matcher(uni, pS, pS + uSLen, pPatStart, pP + uPLen);
+    const char* pTry = pS + uInit;
+    do {
+        matcher.m_uLevel = 0;
+        if (const char* pEnd = matcher.Match(pTry, pPatStart)) {
+            if (bFind) {
+                Args(pState)[0] = TValue_t::Number(static_cast<double>(pTry - pS + 1));
+                Args(pState)[1] = TValue_t::Number(static_cast<double>(pEnd - pS));
+                return 2 + (matcher.m_uLevel
+                                ? PushCaptures(pState, matcher, pS, pTry, pEnd,
+                                               Args(pState) + 2)
+                                : 0);
+            }
+            return PushCaptures(pState, matcher, pS, pTry, pEnd, Args(pState));
+        }
+    } while (pTry++ < pS + uSLen && !bAnchor);
+    Args(pState)[0] = TValue_t::Nil();
+    return 1;
+}
+
+std::int32_t LibStringFind(lua_State* pState) { return StringFindCommon(pState, true); }
+std::int32_t LibStringMatch(lua_State* pState) { return StringFindCommon(pState, false); }
+
+// gmatch iterator: a C closure whose upvalues hold (source, pattern, pos).
+std::int32_t LibGMatchAux(lua_State* pState) {
+    auto* pSelf = static_cast<C_GcFunction*>(Args(pState)[-2].AsGcPointer());
+    TValue_t* pUp = pSelf->CUpvalues();
+    auto* pSrc = static_cast<C_GcString*>(pUp[0].AsGcPointer());
+    auto* pPat = static_cast<C_GcString*>(pUp[1].AsGcPointer());
+    const char* pS = pSrc->Data();
+    const std::size_t uSLen = pSrc->Length();
+    const char* pP = pPat->Data();
+    C_Universe& uni = *Uni(pState);
+    rt::C_PatternMatcher matcher(uni, pS, pS + uSLen, pP, pP + pPat->Length());
+    for (auto uPos = static_cast<std::size_t>(pUp[2].AsDouble()); uPos <= uSLen; ++uPos) {
+        matcher.m_uLevel = 0;
+        if (const char* pEnd = matcher.Match(pS + uPos, pP)) {
+            // Next scan starts past this match; an empty match still advances.
+            const auto uNext = static_cast<std::size_t>(pEnd - pS);
+            pUp[2] = TValue_t::Number(
+                static_cast<double>(uNext > uPos ? uNext : uPos + 1));
+            return PushCaptures(pState, matcher, pS, pS + uPos, pEnd, Args(pState));
+        }
+    }
+    Args(pState)[0] = TValue_t::Nil();
+    return 1;
+}
+
+std::int32_t LibStringGMatch(lua_State* pState) {
+    C_GcString* pSrc = StrArg(pState, 0, "gmatch");
+    C_GcString* pPat = StrArg(pState, 1, "gmatch");
+    C_Universe& uni = *Uni(pState);
+    auto* pFn = static_cast<C_GcFunction*>(
+        uni.Gc().AllocObject(EGcObjectType::Function, C_GcFunction::CAllocSize(3)));
+    pFn->m_Header.uExtra1 = static_cast<std::uint8_t>(EFastFunc::C);
+    pFn->m_Header.uExtra2 = 3;
+    pFn->m_rEnv = uni.MakeRef(uni.Globals());
+    pFn->m_pPc = &uni.m_insCFuncHeader.uRaw;
+    pFn->CFunc() = &LibGMatchAux;
+    pFn->CUpvalues()[0] = TValue_t::GcObject(EValueTag::String, pSrc);
+    pFn->CUpvalues()[1] = TValue_t::GcObject(EValueTag::String, pPat);
+    pFn->CUpvalues()[2] = TValue_t::Number(0);
+    Args(pState)[0] = TValue_t::GcObject(EValueTag::Function, pFn);
+    return 1;
+}
+
+std::int32_t LibStringGSub(lua_State* pState) {
+    C_GcString* pSrc = StrArg(pState, 0, "gsub");
+    C_GcString* pPat = StrArg(pState, 1, "gsub");
+    const TValue_t tvRepl = Args(pState)[2];
+    const bool bHasMax = ArgCount(pState) > 3 && !Args(pState)[3].IsNil();
+    const auto nMax = bHasMax ? static_cast<std::int64_t>(NumArg(pState, 3, "gsub"))
+                              : static_cast<std::int64_t>(-1);
+    C_Universe& uni = *Uni(pState);
+    C_LuaThread* pThread = Th(pState);
+
+    const char* pS = pSrc->Data();
+    const std::size_t uSLen = pSrc->Length();
+    const char* pP = pPat->Data();
+    const std::size_t uPLen = pPat->Length();
+    const bool bAnchor = uPLen > 0 && *pP == '^';
+    const char* pPatStart = pP + (bAnchor ? 1 : 0);
+
+    rt::C_PatternMatcher matcher(uni, pS, pS + uSLen, pPatStart, pP + uPLen);
+    std::string sOut;
+    const char* pCur = pS;
+    std::int64_t nCount = 0;
+    while (nMax < 0 || nCount < nMax) {
+        matcher.m_uLevel = 0;
+        const char* pEnd = matcher.Match(pCur, pPatStart);
+        if (pEnd) {
+            ++nCount;
+            // Produce the replacement for pCur..pEnd.
+            if (tvRepl.Is(EValueTag::String)) {
+                auto* pRepl = static_cast<C_GcString*>(tvRepl.AsGcPointer());
+                const char* pR = pRepl->Data();
+                for (std::size_t uI = 0; uI < pRepl->Length(); ++uI) {
+                    if (pR[uI] != '%' || uI + 1 >= pRepl->Length()) {
+                        sOut.push_back(pR[uI]);
+                        continue;
+                    }
+                    const char cNext = pR[++uI];
+                    if (cNext == '%') {
+                        sOut.push_back('%');
+                    } else if (cNext == '0') {
+                        sOut.append(pCur, static_cast<std::size_t>(pEnd - pCur));
+                    } else if (cNext >= '1' && cNext <= '9') {
+                        const TValue_t tvCap = CaptureValue(
+                            pState, matcher,
+                            matcher.m_uLevel ? static_cast<std::uint32_t>(cNext - '1')
+                                             : 1u,
+                            pS, pCur, pEnd);
+                        std::string sPart;
+                        ToStringBuf(uni, tvCap, sPart);
+                        sOut += sPart;
+                    } else {
+                        RaiseError(uni, "invalid use of '%%' in replacement string");
+                    }
+                }
+            } else {
+                TValue_t tvValue;
+                if (tvRepl.Is(EValueTag::Table)) {
+                    const TValue_t tvKey =
+                        CaptureValue(pState, matcher, matcher.m_uLevel ? 0u : 1u, pS,
+                                     pCur, pEnd);
+                    auto* pTab = static_cast<C_GcTable*>(tvRepl.AsGcPointer());
+                    const TValue_t* pSlot = pTab->Get(uni, tvKey);
+                    tvValue = pSlot ? *pSlot : TValue_t::Nil();
+                } else if (tvRepl.Is(EValueTag::Function)) {
+                    // Call repl(captures...) in a frame above the current top.
+                    TValue_t* pFrame = pThread->m_pTop + 8;
+                    pFrame[0] = tvRepl;
+                    pFrame[1] = TValue_t::Nil();
+                    const std::int32_t nArgs =
+                        PushCaptures(pState, matcher, pS, pCur, pEnd, pFrame + 2);
+                    TValue_t* pSavedBase = pThread->m_pBase;
+                    TValue_t* pSavedTop = pThread->m_pTop;
+                    C_Interpreter::Call(pThread, pFrame, nArgs, 1);
+                    pThread->m_pBase = pSavedBase;
+                    pThread->m_pTop = pSavedTop;
+                    tvValue = pFrame[0];
+                } else {
+                    RaiseError(uni, "bad argument #3 to 'gsub' (string/function/table)");
+                }
+                if (tvValue.IsNil() || tvValue.uRaw == TValue_t::Boolean(false).uRaw) {
+                    sOut.append(pCur, static_cast<std::size_t>(pEnd - pCur));
+                } else if (tvValue.Is(EValueTag::String) || tvValue.IsDouble()) {
+                    std::string sPart;
+                    ToStringBuf(uni, tvValue, sPart);
+                    sOut += sPart;
+                } else {
+                    RaiseError(uni, "invalid replacement value in 'gsub'");
+                }
+            }
+        }
+        if (pEnd && pEnd > pCur) {
+            pCur = pEnd;
+        } else {
+            // No match (or an empty one): copy one byte and move on.
+            if (pCur >= pS + uSLen) break;
+            sOut.push_back(*pCur++);
+        }
+        if (bAnchor) break;
+    }
+    sOut.append(pCur, static_cast<std::size_t>(pS + uSLen - pCur));
+    Args(pState)[0] = TValue_t::GcObject(EValueTag::String, uni.Interner().Intern(sOut));
+    Args(pState)[1] = TValue_t::Number(static_cast<double>(nCount));
+    return 2;
+}
+
 std::int32_t LibStringFormat(lua_State* pState) {
     C_GcString* pFmt = StrArg(pState, 0, "format");
     C_Universe& uni = *Uni(pState);
@@ -726,6 +973,10 @@ void OpenStdLib(C_Universe& uni) {
     SetField(uni, pGlobals, "string", TValue_t::GcObject(EValueTag::Table, pString));
     RegisterFn(uni, pString, "len", &LibStringLen, EFastFunc::StringLen);
     RegisterFn(uni, pString, "sub", &LibStringSub, EFastFunc::StringSub);
+    RegisterFn(uni, pString, "find", &LibStringFind);
+    RegisterFn(uni, pString, "match", &LibStringMatch);
+    RegisterFn(uni, pString, "gmatch", &LibStringGMatch);
+    RegisterFn(uni, pString, "gsub", &LibStringGSub);
     RegisterFn(uni, pString, "format", &LibStringFormat);
     RegisterFn(uni, pString, "rep", &LibStringRep);
     RegisterFn(uni, pString, "byte", &LibStringByte);

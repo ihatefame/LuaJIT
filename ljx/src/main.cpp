@@ -67,7 +67,30 @@ int main(int nArgc, char** vArgv) {
         FileReader_t reader{sSource.data(), sSource.size(), false};
         fe::C_Lexer lexer(*pUni, &ReadAll, &reader, pChunkName);
         fe::C_Parser parser(lexer, *pUni);
-        vm::C_GcProto* pProto = parser.ParseChunk();
+        // Parse under an error frame: a syntax error must print like any
+        // other error, not abort as "unprotected".
+        vm::C_GcProto* pProto = nullptr;
+        {
+            vm::ErrorFrame_t frame;
+            frame.pPrev = pUni->m_pErrorTop;
+            frame.pStackTop = pUni->MainThread()->m_pTop;
+            pUni->m_pErrorTop = &frame;
+            if (setjmp(frame.jb) != 0) {
+                pUni->m_pErrorTop = frame.pPrev;
+                char vMessage[512] = "?";
+                const vm::TValue_t tvErr = pUni->m_tvErrorValue;
+                if (tvErr.Is(vm::EValueTag::String)) {
+                    auto* pStr = static_cast<vm::C_GcString*>(tvErr.AsGcPointer());
+                    std::snprintf(vMessage, sizeof vMessage, "%.*s",
+                                  static_cast<int>(pStr->Length()), pStr->Data());
+                }
+                std::fprintf(stderr, "ljx: %s\n", vMessage);
+                pUni->Destroy();
+                return 1;
+            }
+            pProto = parser.ParseChunk();
+            pUni->m_pErrorTop = frame.pPrev;
+        }
 
         // Wrap in a closure and call with 0 arguments.
         auto* pMain = static_cast<vm::C_GcFunction*>(pUni->Gc().AllocObject(

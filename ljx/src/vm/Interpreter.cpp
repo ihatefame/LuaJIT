@@ -303,22 +303,31 @@ LJX_NOINLINE TValue_t ArithSlow(C_Universe* pUni, TValue_t* pBase, const BcIns_t
 // results land at pBase-2.. which overlaps the link at pBase-1, so the order
 // is load-bearing (a 2+-result return would otherwise clobber its own link).
 LJX_PRESERVE_NONE void ReturnDispatch(LJX_HANDLER_ARGS) {
-    const FrameLink_t link{pBase[-1].uRaw};
+    FrameLink_t link{pBase[-1].uRaw};
     const std::uint32_t uResults = static_cast<std::uint32_t>(uRd);
     const std::uint32_t uSrc = static_cast<std::uint32_t>(uRa);
-    TValue_t* pResults = pBase - 2;
+    // A vararg frame is two links deep: hop down to the real frame start
+    // (where the caller's callee slot and return link live) before copying
+    // results. Sources sit above both destinations, so the ascending copy
+    // stays safe.
+    TValue_t* pRealBase = pBase;
+    while (link.Type() == EFrameType::Vararg) [[unlikely]] {
+        pRealBase -= link.Delta() / sizeof(TValue_t);
+        link = FrameLink_t{pRealBase[-1].uRaw};
+    }
+    TValue_t* pResults = pRealBase - 2;
     for (std::uint32_t uI = 0; uI < uResults; ++uI) pResults[uI] = pBase[uSrc + uI];
 
     if (!link.IsLua()) {
-        // C-entry frame: results already at pBase-2; unwind to C++.
+        // C-entry frame: results already at pRealBase-2; unwind to C++.
         pUni->m_uEntryResults = uResults;
         C_LuaThread* pThread = pUni->MainThread();
-        pThread->m_pTop = pBase - 2 + uResults;
+        pThread->m_pTop = pResults + uResults;
         return;
     }
     const BcIns_t* pRetPc = link.ReturnPc();
     const BcIns_t insCall{pRetPc[-1].uRaw};
-    TValue_t* pPrevBase = pBase - 2 - insCall.A();
+    TValue_t* pPrevBase = pRealBase - 2 - insCall.A();
     const std::uint32_t uExpected = insCall.B();  // nresults+1; 0 = all
     if (uExpected == 0)
         pUni->m_uMultRes = uResults;
@@ -999,8 +1008,13 @@ LJX_H(CallM) {
 }
 LJX_H(CallT) {
     // Tailcall: move func+args down over the current frame; keep the link.
+    // A vararg frame is replaced down to its REAL start (below the vararg
+    // gap), or the gap would leak stack on every recursive tail call.
     const std::uint32_t uArgs = static_cast<std::uint32_t>(uRd) - 1;
     TValue_t* pFuncSlot = pBase + uRa;
+    const FrameLink_t link{pBase[-1].uRaw};
+    if (link.Type() == EFrameType::Vararg) [[unlikely]]
+        pBase -= link.Delta() / sizeof(TValue_t);
     pBase[-2] = *pFuncSlot;
     for (std::uint32_t uI = 0; uI < uArgs; ++uI) pBase[uI] = pFuncSlot[2 + uI];
     if (!pBase[-2].Is(EValueTag::Function)) [[unlikely]]
@@ -1267,8 +1281,66 @@ LJX_H(Jmp) {
     LJX_NEXT();
 }
 
-LJX_H(VarG) { ErrorAtPc(pUni, pBase, pPc, "varargs not supported yet%s", ""); }
-LJX_H(FuncV) { ErrorAtPc(pUni, pBase, pPc, "vararg functions not supported yet%s", ""); }
+LJX_H(VarG) {
+    // A = destination, D packs C = fixed param count (low byte) and
+    // B = nresults+1 (high byte; 0 = copy all and set MULTRES). The varargs
+    // sit between the pre-shift frame's params and the shifted base — the
+    // Vararg link's delta locates them without touching the proto.
+    const std::uint32_t uC = static_cast<std::uint32_t>(uRd) & 0xff;
+    const std::uint32_t uB = (static_cast<std::uint32_t>(uRd) >> 8) & 0xff;
+    const FrameLink_t link{pBase[-1].uRaw};
+    std::uint32_t uCount = 0;
+    TValue_t* pVar = pBase;
+    if (link.Type() == EFrameType::Vararg) [[likely]] {
+        const std::uint32_t uDeltaSlots =
+            static_cast<std::uint32_t>(link.Delta() / sizeof(TValue_t));
+        pVar = pBase - uDeltaSlots + uC;
+        if (uDeltaSlots > 2 + uC) uCount = uDeltaSlots - 2 - uC;
+    }
+    TValue_t* pDst = pBase + uRa;
+    if (uB == 0) {
+        C_LuaThread* pThread = pUni->MainThread();
+        if (pDst + uCount + kStackExtraSlots > pThread->m_pMaxStack) [[unlikely]]
+            RaiseError(*pUni, "stack overflow");
+        for (std::uint32_t uI = 0; uI < uCount; ++uI) pDst[uI] = pVar[uI];
+        pUni->m_uMultRes = uCount;
+        if (pDst + uCount > pThread->m_pHighWater) pThread->m_pHighWater = pDst + uCount;
+    } else {
+        for (std::uint32_t uI = 0; uI < uB - 1; ++uI)
+            pDst[uI] = uI < uCount ? pVar[uI] : TValue_t::Nil();
+    }
+    LJX_NEXT();
+}
+LJX_H(FuncV) {
+    // uRa = framesize, uRd = nargs. The frame moves UP past the supplied
+    // arguments: fixed params are copied to the new base, the surplus stays
+    // behind as the varargs, and a Vararg link at the new base records the
+    // shift so returns and VarG can find their way back.
+    const std::uint32_t uFrame = static_cast<std::uint32_t>(uRa);
+    const std::uint32_t uArgs = static_cast<std::uint32_t>(uRd);
+    C_LuaThread* pThread = pUni->MainThread();
+    TValue_t* pNewBase = pBase + uArgs + 2;
+    if (pNewBase + uFrame + kStackExtraSlots > pThread->m_pMaxStack) [[unlikely]]
+        RaiseError(*pUni, "stack overflow");
+    auto* pProto = const_cast<C_GcProto*>(C_GcProto::FromBytecode(
+        reinterpret_cast<const std::uint32_t*>(pPc - 1)));
+    const std::uint32_t uParams = pProto->ParamCount();
+    pNewBase[-2] = pBase[-2];   // callee copy: FrameProto reads base[-2]
+    pNewBase[-1] = TValue_t{FrameLink_t::FromDelta((uArgs + 2) * sizeof(TValue_t),
+                                                   EFrameType::Vararg)
+                                .uRaw};
+    for (std::uint32_t uI = 0; uI < uParams; ++uI)
+        pNewBase[uI] = uI < uArgs ? pBase[uI] : TValue_t::Nil();
+    pBase = pNewBase;
+    if (pBase + uFrame > pThread->m_pHighWater) pThread->m_pHighWater = pBase + uFrame;
+    if (pUni->Gc().NeedsStep() && !pUni->m_uRecording) [[unlikely]] {
+        pThread->m_pBase = pBase;
+        pThread->m_pTop = pBase + uFrame;
+        pUni->Gc().CollectNow();
+    }
+    pKBase = KBaseOf(pUni, pProto);
+    LJX_NEXT();
+}
 LJX_H(IFuncF) { LJX_MUSTTAIL return OpFuncF(LJX_PASS_ARGS); }
 LJX_H(JFuncF) { LJX_MUSTTAIL return OpFuncF(LJX_PASS_ARGS); }
 LJX_H(IFuncV) { LJX_MUSTTAIL return OpFuncV(LJX_PASS_ARGS); }

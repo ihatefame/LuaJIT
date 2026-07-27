@@ -58,6 +58,7 @@ struct FuncState_t {
     std::uint32_t uFrameMax = 2;
     std::uint8_t uNumParams = 0;
     bool bAnyCaptured = false;
+    bool bVararg = false;
 };
 
 struct Ctx_t {
@@ -697,7 +698,21 @@ void Ctx_t::ParseSimpleExpr(ExpDesc_t& e) {
             Next();
             ParseFunctionBody(e, false);
             return;
-        case static_cast<std::uint16_t>(ETokenKind::Ellipsis): Error("'...' is not supported yet");
+        case static_cast<std::uint16_t>(ETokenKind::Ellipsis): {
+            // `...` is a multi-valued expression, modelled exactly like a
+            // call: the VarG instruction's B field is the result count every
+            // Call consumer already knows how to patch (0 = all results).
+            if (!fs->bVararg) Error("cannot use '...' outside a vararg function");
+            Next();
+            const std::uint8_t uBase = static_cast<std::uint8_t>(fs->uFreeReg);
+            ReserveRegs(1);
+            const std::uint32_t uPos = EmitABC(EBcOp::VarG, uBase, 2, fs->uNumParams);
+            e = ExpDesc_t{};
+            e.eKind = EExpKind::Call;
+            e.payload.slotPair.uInfo = uPos;
+            e.payload.slotPair.uAux = uBase;
+            return;
+        }
         default: ParseSuffixedExpr(e); return;
     }
 }
@@ -1420,8 +1435,14 @@ void Ctx_t::ParseReturn() {
         const std::uint32_t uFirst = fs->uFreeReg;
         ExpDesc_t eLast;
         const std::uint32_t uCount = ParseExprList(eLast);
-        if (eLast.eKind == EExpKind::Call && uCount == 1 && !fs->bAnyCaptured) {
-            // Tailcall: rewrite the call instruction in place.
+        const bool bLastIsCallIns =
+            eLast.eKind == EExpKind::Call &&
+            (fs->vCode[eLast.payload.slotPair.uInfo].Op() == EBcOp::Call ||
+             fs->vCode[eLast.payload.slotPair.uInfo].Op() == EBcOp::CallM);
+        if (bLastIsCallIns && uCount == 1 && !fs->bAnyCaptured) {
+            // Tailcall: rewrite the call instruction in place. (`return ...`
+            // shares the Call expression kind but its VarG instruction is not
+            // a call — it takes the RetM path below.)
             BcIns_t& ins = fs->vCode[eLast.payload.slotPair.uInfo];
             const EBcOp eCallOp = ins.Op();
             const std::uint8_t uCallBase = ins.A();
@@ -1608,7 +1629,11 @@ void Ctx_t::ParseFunctionBody(ExpDesc_t& e, bool bIsMethod) {
     }
     if (Tok() != static_cast<ETokenKind>(')')) {
         for (;;) {
-            if (Tok() == ETokenKind::Ellipsis) Error("'...' is not supported yet");
+            if (Tok() == ETokenKind::Ellipsis) {
+                Next();
+                funcState.bVararg = true;
+                break;   // '...' must be the last parameter
+            }
             NewLocal(ExpectName());
             ActivateLocals(1);
             ++funcState.uNumParams;
@@ -1621,9 +1646,10 @@ void Ctx_t::ParseFunctionBody(ExpDesc_t& e, bool bIsMethod) {
     ParseBlock();
     Expect(ETokenKind::End, "end");
     C_GcProto* pProto = FinishFunction();
-    // Patch the header with the final frame size.
+    // Patch the header with the final frame size (and the vararg variant).
     auto* pBc = const_cast<std::uint32_t*>(pProto->Bytecode());
-    pBc[0] = BcIns_t::MakeAD(EBcOp::FuncF, pProto->m_Header.uExtra2, 0).uRaw;
+    pBc[0] = BcIns_t::MakeAD(funcState.bVararg ? EBcOp::FuncV : EBcOp::FuncF,
+                             pProto->m_Header.uExtra2, 0).uRaw;
 
     fs = funcState.pParent;
 

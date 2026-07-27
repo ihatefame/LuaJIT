@@ -206,6 +206,53 @@ std::int32_t LibGetMetatable(lua_State* pState) {
     return 1;
 }
 
+std::int32_t LibSelect(lua_State* pState) {
+    const std::int32_t nArgs = ArgCount(pState);
+    if (nArgs < 1) RaiseError(*Uni(pState), "bad argument #1 to 'select'");
+    const TValue_t tvSel = Args(pState)[0];
+    if (tvSel.Is(EValueTag::String)) {
+        auto* pStr = static_cast<C_GcString*>(tvSel.AsGcPointer());
+        if (pStr->m_uLength == 1 && pStr->Data()[0] == '#') {
+            Args(pState)[0] = TValue_t::Number(static_cast<double>(nArgs - 1));
+            return 1;
+        }
+        RaiseError(*Uni(pState), "bad argument #1 to 'select' (number expected)");
+    }
+    const double flIdx = NumArg(pState, 0, "select");
+    std::int32_t nIdx = static_cast<std::int32_t>(flIdx);
+    if (nIdx < 0) nIdx += nArgs;   // select(-k, ...): the k-th from the end
+    if (nIdx < 1)
+        RaiseError(*Uni(pState), "bad argument #1 to 'select' (index out of range)");
+    if (nIdx >= nArgs) return 0;
+    const std::int32_t nOut = nArgs - nIdx;
+    for (std::int32_t nI = 0; nI < nOut; ++nI)
+        Args(pState)[nI] = Args(pState)[nIdx + nI];
+    return nOut;
+}
+
+std::int32_t LibUnpack(lua_State* pState) {
+    C_GcTable* pTab = TabArg(pState, 0, "unpack");
+    C_Universe& uni = *Uni(pState);
+    const std::int32_t nFrom =
+        ArgCount(pState) > 1 ? static_cast<std::int32_t>(NumArg(pState, 1, "unpack")) : 1;
+    const std::int32_t nTo = ArgCount(pState) > 2
+                                 ? static_cast<std::int32_t>(NumArg(pState, 2, "unpack"))
+                                 : static_cast<std::int32_t>(pTab->Length(uni));
+    if (nFrom > nTo) return 0;
+    const std::int32_t nCount = nTo - nFrom + 1;
+    C_LuaThread* pThread = Th(pState);
+    if (pThread->m_pBase + nCount + vm::kStackExtraSlots > pThread->m_pMaxStack)
+        RaiseError(uni, "too many results to unpack");
+    if (pThread->m_pBase + nCount > pThread->m_pHighWater)
+        pThread->m_pHighWater = pThread->m_pBase + nCount;
+    for (std::int32_t nI = 0; nI < nCount; ++nI) {
+        const TValue_t* pSlot =
+            pTab->Get(uni, TValue_t::Number(static_cast<double>(nFrom + nI)));
+        Args(pState)[nI] = pSlot ? *pSlot : TValue_t::Nil();
+    }
+    return nCount;
+}
+
 std::int32_t LibRawGet(lua_State* pState) {
     C_GcTable* pTab = TabArg(pState, 0, "rawget");
     const TValue_t* pSlot = pTab->Get(*Uni(pState), Args(pState)[1]);
@@ -220,8 +267,41 @@ std::int32_t LibRawSet(lua_State* pState) {
 }
 
 std::int32_t LibError(lua_State* pState) {
-    RaiseErrorValue(*Uni(pState),
-                    ArgCount(pState) > 0 ? Args(pState)[0] : TValue_t::Nil());
+    C_Universe& uni = *Uni(pState);
+    const TValue_t tvErr = ArgCount(pState) > 0 ? Args(pState)[0] : TValue_t::Nil();
+    const bool bAddPos = !(ArgCount(pState) > 1 && Args(pState)[1].IsDouble() &&
+                           Args(pState)[1].AsDouble() == 0.0);
+    // error(message [,level]): a string message at level != 0 is prefixed
+    // with the caller's position, as in the reference implementation.
+    if (tvErr.Is(EValueTag::String) && bAddPos) {
+        TValue_t* pBase = Args(pState);
+        const FrameLink_t link{pBase[-1].uRaw};
+        if (link.IsLua()) {
+            const BcIns_t* pRetPc = link.ReturnPc();
+            const BcIns_t insCall{pRetPc[-1].uRaw};
+            const TValue_t* pCallerBase = pBase - 2 - insCall.A();
+            const auto* pCaller =
+                static_cast<const C_GcFunction*>(pCallerBase[-2].AsGcPointer());
+            const C_GcProto* pProto = C_GcProto::FromBytecode(pCaller->m_pPc);
+            const C_GcString* pChunk = uni.Deref<C_GcString>(pProto->m_rChunkName);
+            core::BcLine_t uLine = 0;
+            if (!pProto->m_rLineInfo.IsNull()) {
+                const auto* pLines = static_cast<const core::BcLine_t*>(
+                    core::RefToPtr(uni.ArenaBase(), pProto->m_rLineInfo));
+                const auto uIdx = static_cast<std::size_t>(
+                    pRetPc - 1 - reinterpret_cast<const BcIns_t*>(pProto->Bytecode()));
+                if (uIdx < pProto->m_uBcCount) uLine = pLines[uIdx];
+            }
+            auto* pMsg = static_cast<C_GcString*>(tvErr.AsGcPointer());
+            char vBuffer[512];
+            std::snprintf(vBuffer, sizeof vBuffer, "%s:%u: %.*s",
+                          pChunk ? pChunk->Data() : "?", uLine,
+                          static_cast<int>(pMsg->Length()), pMsg->Data());
+            RaiseErrorValue(uni, TValue_t::GcObject(EValueTag::String,
+                                                    uni.Interner().Intern(vBuffer)));
+        }
+    }
+    RaiseErrorValue(uni, tvErr);
 }
 
 std::int32_t LibAssert(lua_State* pState) {
@@ -507,6 +587,8 @@ void OpenStdLib(C_Universe& uni) {
     RegisterFn(uni, pGlobals, "ipairs", &LibIPairs);
     RegisterFn(uni, pGlobals, "setmetatable", &LibSetMetatable);
     RegisterFn(uni, pGlobals, "getmetatable", &LibGetMetatable);
+    RegisterFn(uni, pGlobals, "select", &LibSelect);
+    RegisterFn(uni, pGlobals, "unpack", &LibUnpack);
     RegisterFn(uni, pGlobals, "rawget", &LibRawGet);
     RegisterFn(uni, pGlobals, "rawset", &LibRawSet);
     RegisterFn(uni, pGlobals, "error", &LibError);
@@ -557,6 +639,7 @@ void OpenStdLib(C_Universe& uni) {
     RegisterFn(uni, pTable, "insert", &LibTableInsert, EFastFunc::TableInsert);
     RegisterFn(uni, pTable, "remove", &LibTableRemove);
     RegisterFn(uni, pTable, "concat", &LibTableConcat, EFastFunc::TableConcat);
+    RegisterFn(uni, pTable, "unpack", &LibUnpack);
 
     C_GcTable* pOs = C_GcTable::New(uni, 0, 1);
     SetField(uni, pGlobals, "os", TValue_t::GcObject(EValueTag::Table, pOs));

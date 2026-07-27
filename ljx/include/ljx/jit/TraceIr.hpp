@@ -42,6 +42,8 @@ enum class EIrType : std::uint8_t {
     /* entry type guard; SStore is the write-through for slots the trace     */\
     /* assigns but never reads (see TRACE_DESIGN.md §6).                     */\
     X(SLoad) X(SStore)                                                         \
+    X(SReload)        /* typed slot load IN PLACE (not hoisted): re-reads a  */ \
+                      /* slot a helper call just wrote                       */ \
     X(KLoad)          /* constant -> register, so the loop body never          */ \
                       /* rematerializes it                                    */ \
     /* arithmetic on guarded numbers */                                        \
@@ -77,6 +79,7 @@ enum class EIrType : std::uint8_t {
     X(CallCat)        /* rOp1 = desc first|count<<8; -> tagged string        */ \
     X(CallLen)        /* rOp1 = desc table slot; -> length as Int            */ \
     X(CallNewFunc)    /* rOp1 = desc protoIdx|frameBase<<16; -> tagged func */ \
+    X(CallIter)       /* run a C iterator, results copied to A, A+1         */ \
     X(CallC)          /* rOp1 = desc func|args<<8; leaf C builtin call      */ \
     /* control */                                                              \
     X(Loop)           /* the back edge                                      */ \
@@ -98,6 +101,7 @@ enum class EIrOp : std::uint8_t {
     switch (eOp) {
         case EIrOp::Nop:
         case EIrOp::SLoad:
+        case EIrOp::SReload:
         case EIrOp::SStore:
         case EIrOp::StoreTV:
         case EIrOp::CallNewTab:
@@ -107,6 +111,7 @@ enum class EIrOp : std::uint8_t {
         case EIrOp::CallLen:
         case EIrOp::CallNewFunc:
         case EIrOp::CallC:
+        case EIrOp::CallIter:
         case EIrOp::Loop:
         case EIrOp::End:
             return false;
@@ -121,7 +126,7 @@ enum class EIrOp : std::uint8_t {
         case EIrOp::GuardGt: case EIrOp::GuardEq: case EIrOp::GuardNe:
         case EIrOp::GuardFEq: case EIrOp::GuardFNe:
         case EIrOp::GuardEqI: case EIrOp::GuardBelow: case EIrOp::ChkInt32:
-        case EIrOp::SLoad: case EIrOp::LoadTV: case EIrOp::ToInt:
+        case EIrOp::SLoad: case EIrOp::SReload: case EIrOp::LoadTV: case EIrOp::ToInt:
             return true;
         default:
             return false;

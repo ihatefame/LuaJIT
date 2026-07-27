@@ -310,17 +310,30 @@ bool TableNext(C_Universe& uni, C_GcTable* pTab, const TValue_t& tvKey, TValue_t
         if (uIndex < pTab->m_uArraySize) {
             uStart = uIndex + 1;
         } else {
-            // Resume from a hash node.
-            const TValue_t* pSlot = pTab->Get(uni, tvKey);
-            if (!pSlot) RaiseError(uni, "invalid key to 'next'");
-            const auto* pNode = reinterpret_cast<const TableNode_t*>(pSlot);
+            // Resume from a hash node. The universe's one-entry hint caches
+            // where this key was found on the previous step, collapsing the
+            // hash lookup to one compare for in-order iteration. The hint is
+            // validated by re-reading the node's key, so a stale entry
+            // (resize, free, address reuse) misses instead of misdirecting.
             TableNode_t* pNodes = NodeArray(uni, pTab);
-            for (std::uint32_t uI =
-                     static_cast<std::uint32_t>(pNode - pNodes) + 1;
-                 uI <= pTab->m_uHashMask; ++uI) {
+            std::uint32_t uNode;
+            if (uni.m_pIterHintTab == pTab && uni.m_uIterHintKey == tvKey.uRaw &&
+                uni.m_uIterHintNode <= pTab->m_uHashMask &&
+                pNodes[uni.m_uIterHintNode].tvKey == tvKey) {
+                uNode = uni.m_uIterHintNode;
+            } else {
+                const TValue_t* pSlot = pTab->Get(uni, tvKey);
+                if (!pSlot) RaiseError(uni, "invalid key to 'next'");
+                uNode = static_cast<std::uint32_t>(
+                    reinterpret_cast<const TableNode_t*>(pSlot) - pNodes);
+            }
+            for (std::uint32_t uI = uNode + 1; uI <= pTab->m_uHashMask; ++uI) {
                 if (!pNodes[uI].tvValue.IsNil()) {
                     tvOutKey = pNodes[uI].tvKey;
                     tvOutVal = pNodes[uI].tvValue;
+                    uni.m_pIterHintTab = pTab;
+                    uni.m_uIterHintKey = tvOutKey.uRaw;
+                    uni.m_uIterHintNode = uI;
                     return true;
                 }
             }
@@ -340,6 +353,9 @@ bool TableNext(C_Universe& uni, C_GcTable* pTab, const TValue_t& tvKey, TValue_t
             if (!pNodes[uI].tvValue.IsNil()) {
                 tvOutKey = pNodes[uI].tvKey;
                 tvOutVal = pNodes[uI].tvValue;
+                uni.m_pIterHintTab = pTab;
+                uni.m_uIterHintKey = tvOutKey.uRaw;
+                uni.m_uIterHintNode = uI;
                 return true;
             }
         }

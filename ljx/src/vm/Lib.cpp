@@ -502,7 +502,7 @@ void OpenStdLib(C_Universe& uni) {
     RegisterFn(uni, pGlobals, "type", &LibType);
     RegisterFn(uni, pGlobals, "tostring", &LibToString, EFastFunc::ToString);
     RegisterFn(uni, pGlobals, "tonumber", &LibToNumber);
-    RegisterFn(uni, pGlobals, "next", &LibNext);
+    RegisterFn(uni, pGlobals, "next", &LibNext, EFastFunc::Next);
     RegisterFn(uni, pGlobals, "pairs", &LibPairs);
     RegisterFn(uni, pGlobals, "ipairs", &LibIPairs);
     RegisterFn(uni, pGlobals, "setmetatable", &LibSetMetatable);
@@ -517,7 +517,7 @@ void OpenStdLib(C_Universe& uni) {
     // pairs/ipairs helper functions parked in the registry.
     *uni.Registry()->Set(
         uni, TValue_t::GcObject(EValueTag::String, uni.Interner().Intern("next"))) =
-        TValue_t::GcObject(EValueTag::Function, NewCFunction(uni, &LibNext));
+        TValue_t::GcObject(EValueTag::Function, NewCFunction(uni, &LibNext, EFastFunc::Next));
     *uni.Registry()->Set(
         uni, TValue_t::GcObject(EValueTag::String, uni.Interner().Intern("ipairs_iter"))) =
         TValue_t::GcObject(EValueTag::Function,

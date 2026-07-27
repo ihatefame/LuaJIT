@@ -18,6 +18,7 @@
 #include "ljx/jit/FuncJit.hpp"
 #include "ljx/jit/LoopJit.hpp"
 #include "ljx/jit/TraceJit.hpp"
+#include "ljx/vm/FastFunc.hpp"
 #include "ljx/vm/Interpreter.hpp"
 
 namespace ljx::vm {
@@ -1168,6 +1169,25 @@ LJX_H(JForL) {
 LJX_H(IterC) {
     // R[A]=R[A-3], R[A+2]=R[A-2], R[A+3]=R[A-1]; then call R[A] with 2 args.
     TValue_t* pSlots = pBase + uRa;
+    // Fast path: the real `next` walking a plain table — one inline table
+    // step instead of a C call frame. Skipped while recording so the
+    // recorder's pending-CFunc-header protocol stays in sync with execution.
+    if (pSlots[-3].Is(EValueTag::Function) && pSlots[-2].Is(EValueTag::Table) &&
+        !pUni->m_uRecording) [[likely]] {
+        auto* pFn = static_cast<C_GcFunction*>(pSlots[-3].AsGcPointer());
+        if (!pFn->IsLua() &&
+            static_cast<EFastFunc>(pFn->m_Header.uExtra1) == EFastFunc::Next) {
+            auto* pTab = static_cast<C_GcTable*>(pSlots[-2].AsGcPointer());
+            TValue_t tvOutKey, tvOutVal;
+            if (TableNext(*pUni, pTab, pSlots[-1], tvOutKey, tvOutVal)) {
+                pSlots[0] = tvOutKey;
+                pSlots[1] = tvOutVal;
+            } else {
+                pSlots[0] = TValue_t::Nil();
+            }
+            LJX_NEXT();
+        }
+    }
     pSlots[0] = pSlots[-3];
     pSlots[2] = pSlots[-2];
     pSlots[3] = pSlots[-1];
@@ -1295,6 +1315,42 @@ namespace ljx::jit {
 using vm::C_GcTable;
 using vm::EValueTag;
 using vm::TValue_t;
+
+// Runs a C iterator through the interpreter's own call protocol: frame at
+// A+2, results copied down to A, A+1 exactly as ReturnDispatch would for the
+// generic-for's two expected results. `next` never allocates, so no GC point.
+std::uint64_t TraceHelpIter(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
+                            std::uint32_t uTop) {
+    (void)uTop;
+    const std::uint32_t uA = uDesc & 0xff;
+    TValue_t* pFrame = pBase + uA + 2;
+    auto* pFn = static_cast<vm::C_GcFunction*>(pBase[uA].AsGcPointer());
+    // The recorded identity guard makes the iterator the real `next` on every
+    // path that reaches this helper — step the table directly, skipping the
+    // C-call framing. The general protocol below stays for any future
+    // CallIter user that is not `next`.
+    if (static_cast<vm::EFastFunc>(pFn->m_Header.uExtra1) == vm::EFastFunc::Next &&
+        pBase[uA + 2].Is(EValueTag::Table)) {
+        auto* pTab = static_cast<C_GcTable*>(pBase[uA + 2].AsGcPointer());
+        TValue_t tvOutKey, tvOutVal;
+        if (vm::TableNext(*pUni, pTab, pBase[uA + 3], tvOutKey, tvOutVal)) {
+            pBase[uA] = tvOutKey;
+            pBase[uA + 1] = tvOutVal;
+        } else {
+            pBase[uA] = TValue_t::Nil();
+            pBase[uA + 1] = TValue_t::Nil();
+        }
+        return pBase[uA].uRaw;
+    }
+    vm::C_LuaThread* pThread = pUni->MainThread();
+    pThread->m_pBase = pFrame;
+    pThread->m_pTop = pFrame + 2;
+    if (pFrame + 2 > pThread->m_pHighWater) pThread->m_pHighWater = pFrame + 2;
+    const std::int32_t nResults = pFn->CFunc()(reinterpret_cast<lua_State*>(pThread));
+    pBase[uA] = nResults > 0 ? pFrame[0] : TValue_t::Nil();
+    pBase[uA + 1] = nResults > 1 ? pFrame[1] : TValue_t::Nil();
+    return pBase[uA].uRaw;
+}
 
 std::uint64_t TraceHelpNewFunc(vm::C_Universe* pUni, TValue_t* pBase, std::uint32_t uDesc,
                                std::uint32_t uTop) {

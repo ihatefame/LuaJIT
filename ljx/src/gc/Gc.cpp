@@ -215,6 +215,7 @@ void C_GarbageCollector::CollectNow() noexcept {
     // names (Fixed anyway), base metatables.
     MarkObject(&uni.Globals()->m_Header);
     MarkObject(&uni.Registry()->m_Header);
+    MarkObject(&uni.TracePins()->m_Header);
     MarkObject(&uni.MainThread()->m_Header);
     for (std::uint32_t uRank = 0; uRank < 16; ++uRank) {
         const auto eTag = static_cast<vm::EValueTag>(~uRank);

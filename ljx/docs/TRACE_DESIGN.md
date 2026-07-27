@@ -94,6 +94,42 @@ free — and the two words a call writes (the callee at `base-2`, the link at
 snapshot therefore reconstructs every inlined frame without any special
 machinery, and a trace spans many Lua frames.
 
+## 5a. Iterators
+
+`for i, v in ipairs(t)` records as the array access it is: bump the index,
+guard it below the array size, load the element — the bound guard doubling as
+the loop exit. `for k, v in pairs(t)` cannot be an address computation (the
+successor of a hash key is wherever the node array says it is), so it records
+as a `CallIter` helper: the recorder *simulates* one `next` step at record
+time to learn the result types, emits the call, and re-reads the two result
+slots with `SReload` — a typed in-place load that is never hoisted and never
+CSE'd, because its whole meaning is "what the call just wrote". The key's
+type guard is also the loop's exit: a different key kind, or the iteration
+ending in nil, resumes the interpreter at the `IterC`, which re-runs the
+(idempotent) step and carries on.
+
+A mixed table walks two phases — numeric array keys, then hash-part keys —
+and one trace can only specialize on one key type. The failing entry guard
+grows a *variant*: a second trace at the same head PC, specialized to the
+types present now, reached through the first trace's patched exit stub. Two
+rules keep a variant family from degenerating: the PC→trace map keeps the
+FIRST trace (the head of the chain — a newer variant in the map would put
+the wrong specialization first and grow the chain by one trace per phase
+change, without bound), and an exit is never *linked* to a trace with the
+same start PC (its entry checks are exactly what just failed; a link would
+be a native cycle of type checks with no body between them — only a fresh
+variant makes progress).
+
+At run time the helper steps the table directly (`vm::TableNext`), skipping
+the C-call framing, and a one-entry position hint in the universe remembers
+which node the previous key was found at — validated by re-reading that
+node's key, so a stale hint misses instead of misdirecting. What this tier
+still lacks against LuaJIT's `ITERN` is *positional* iteration: LuaJIT
+carries a hidden node index through the loop and never re-derives the
+position from the key at all. Carrying that index as a trace-internal SSA
+value (slots keep the key, so every deopt stays exact) is the designed next
+step if pairs-heavy workloads warrant it.
+
 ## 6. Snapshots, exits, and the two kinds of slot
 
 A slot that is **read before it is written** gets an entry `SLoad`, is carried
@@ -175,9 +211,13 @@ write to their registers.
   mark past the highest slot a trace touches when the trace returns, since a
   trace writes inlined frames that no `FuncF` ever accounted for. And every GC
   object a trace bakes an address into — a compared constant, a metatable whose
-  version word it reads, an upvalue whose cell it loads — is anchored in the
-  registry, which is an ordinary GC root; a stale object then fails a guard
-  instead of being dereferenced after free.
+  version word it reads, an upvalue whose cell it loads — is anchored in a
+  dedicated pin table, which is an ordinary GC root; a stale object then fails
+  a guard instead of being dereferenced after free. The pins deliberately do
+  NOT live in the registry: pinned values become table *keys*, and the stdlib
+  stores named objects in the registry under string keys — one shared table
+  and a pinned `"next"` string would overwrite the `next` function `pairs`
+  hands out.
 * **Recording is not re-entrant.** A metamethod or C function that calls back
   into the interpreter would otherwise have its bytecodes appended to the trace
   with a bogus frame base, so `C_Interpreter::Call` aborts an in-progress

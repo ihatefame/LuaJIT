@@ -20,6 +20,12 @@
 #include "ljx/vm/Interpreter.hpp"
 #include "ljx/vm/Object.hpp"
 
+namespace ljx::vm {
+// rt/Table.cpp — the same iteration the `next` builtin performs.
+bool TableNext(C_Universe& uni, C_GcTable* pTab, const TValue_t& tvKey, TValue_t& tvOutKey,
+               TValue_t& tvOutVal);
+}
+
 namespace ljx::jit {
 
 using vm::BcIns_t;
@@ -228,12 +234,14 @@ bool C_TraceJit::GuardEntryInt32(IrRef rRef, const BcIns_t* pResumePc) {
 
 // A compiled trace outlives any Lua reference to the objects it specialized
 // on: it compares against their addresses and, for the metatable fold, reads
-// their version words directly. Anchoring them in the registry — an ordinary
+// their version words directly. Anchoring them in the pin table — an ordinary
 // GC root — keeps those addresses valid for the trace's lifetime without
-// teaching the collector anything about traces.
+// teaching the collector anything about traces. This must NOT be the
+// registry: the stdlib stores named objects there, and a pinned value used
+// as a key would overwrite them.
 void C_TraceJit::PinValue(const TValue_t& tvValue) {
     if (!tvValue.IsGcObject()) return;
-    *m_pUniverse->Registry()->Set(*m_pUniverse, tvValue) = TValue_t::Boolean(true);
+    *m_pUniverse->TracePins()->Set(*m_pUniverse, tvValue) = TValue_t::Boolean(true);
 }
 
 IrRef C_TraceJit::Constant(const TValue_t& tvValue) {
@@ -290,6 +298,20 @@ IrRef C_TraceJit::ConstantPtr(const void* pPtr) {
 // assignment, so the interpreter always finds it current after a side exit —
 // which is what keeps deoptimization exact without a loop-carry analysis.
 // ---------------------------------------------------------------------------
+
+// A typed slot load emitted IN PLACE (SReload is never hoisted): the only way
+// to observe a slot a helper call has just written. The type comes from the
+// recorder's SIMULATION of the helper, and the load's guard enforces it.
+IrRef C_TraceJit::ReloadSlot(std::int32_t nSlot, EIrType eType, const BcIns_t* pResumePc) {
+    if (nSlot < -kSlotBias || nSlot >= kMaxSlot) return kIrNone;
+    const auto uIdx = static_cast<std::size_t>(nSlot + kSlotBias);
+    if (nSlot > m_nTopSlot) m_nTopSlot = nSlot;
+    const IrRef rLoad =
+        EmitSnapped(EIrOp::SReload, eType, static_cast<IrRef>(uIdx), kIrNone, pResumePc);
+    if (rLoad == kIrNone) return kIrNone;
+    m_vSlotValue[uIdx] = rLoad;
+    return rLoad;
+}
 
 IrRef C_TraceJit::SlotRef(std::int32_t nSlot) {
     if (nSlot < -kSlotBias || nSlot >= kMaxSlot) {
@@ -459,7 +481,8 @@ void C_TraceJit::DumpIr() const {
         for (int nK = 0; nK < 2; ++nK) {
             const IrRef r = nK == 0 ? ins.rOp1 : ins.rOp2;
             if (r == kIrNone) continue;
-            if (ins.eOp == EIrOp::SLoad || ins.eOp == EIrOp::SStore) {
+            if (ins.eOp == EIrOp::SLoad || ins.eOp == EIrOp::SStore ||
+                ins.eOp == EIrOp::SReload) {
                 if (nK == 0) { std::fprintf(stderr, "slot%d ", static_cast<int>(r) - kSlotBias); continue; }
             }
             if (IsConstRef(r))
@@ -553,8 +576,12 @@ void C_TraceJit::FinishTrace(Trace_t* pTrace, Trace_t* pLinkTarget) {
         m_vExitRegistry.push_back(GlobalExit_t{pTrace, uE});
     m_vTraces.push_back(pTrace);
     // Registered by start PC even for side traces: a later recording that
-    // reaches this PC links here instead of recording the region again.
-    m_mapTraces[m_pStartPc] = pTrace;
+    // reaches this PC links here instead of recording the region again. The
+    // FIRST trace at a PC keeps the entry — it is the head of the variant
+    // chain, and its patched exits already reach every later variant. If a
+    // variant overwrote it, loop entry would land on the NEWEST variant and
+    // the chain would grow by one trace per type alternation, forever.
+    m_mapTraces.try_emplace(m_pStartPc, pTrace);
     if (pTrace->nLinkExit >= 0 && pLinkTarget) {
         pTrace->vExits[static_cast<std::size_t>(pTrace->nLinkExit)].pChild = pLinkTarget;
         PatchExitToChild(pTrace, static_cast<std::uint32_t>(pTrace->nLinkExit));
@@ -617,8 +644,14 @@ void C_TraceJit::OnHotExit(Trace_t* pParent, std::uint32_t uExit, TValue_t* pBas
         exit.uCount = kBlacklistCount;
         return;
     }
+    // Never link within one variant family (same start PC): the candidate's
+    // entry checks are exactly what already failed, so the "chain" would be a
+    // native cycle of type checks with no body between them. A fresh variant,
+    // specialized to the types present now, is the only move that makes
+    // progress.
     if (const auto it = m_mapTraces.find(exit.pResumePc);
-        it != m_mapTraces.end() && it->second != pParent) {
+        it != m_mapTraces.end() && it->second != pParent &&
+        it->second->pStartPc != pParent->pStartPc) {
         exit.pChild = it->second;
         PatchExitToChild(pParent, uExit);
         if (TraceDebug())
@@ -849,8 +882,8 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
             const TValue_t tvIter = m_pBase[uA - 3];
             if (!tvIter.Is(EValueTag::Function)) return false;
             auto* pIter = static_cast<C_GcFunction*>(tvIter.AsGcPointer());
-            if (static_cast<vm::EFastFunc>(pIter->m_Header.uExtra1) !=
-                vm::EFastFunc::IPairsAux)
+            const auto eIterFfid = static_cast<vm::EFastFunc>(pIter->m_Header.uExtra1);
+            if (eIterFfid != vm::EFastFunc::IPairsAux && eIterFfid != vm::EFastFunc::Next)
                 return false;
             const IrRef rIter = SlotRef(nB + static_cast<std::int32_t>(uA) - 3);
             if (rIter == kIrNone) return false;
@@ -858,9 +891,19 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
                 (void)EmitGuard(EIrOp::GuardEq, rIter, Materialize(Constant(tvIter)),
                                 pNext - 1);
             if (m_eState != ETraceState::Recording) return false;
-            if (ins.B() != 3) return false;   // `for i, v in ipairs(t)` exactly
+            if (ins.B() != 3) return false;   // `for k, v in <iter>` exactly
+            // The interpreter's IterC copies before the call; mirror them.
             SetSlot(nB + static_cast<std::int32_t>(uA), rIter);
-            if (!RecordIPairsIter(ins, pNext - 1)) return false;
+            const IrRef rState = SlotRef(nB + static_cast<std::int32_t>(uA) - 2);
+            const IrRef rCtl = SlotRef(nB + static_cast<std::int32_t>(uA) - 1);
+            if (rState == kIrNone || rCtl == kIrNone) return false;
+            SetSlot(nB + static_cast<std::int32_t>(uA) + 2, rState);
+            SetSlot(nB + static_cast<std::int32_t>(uA) + 3, rCtl);
+            if (eIterFfid == vm::EFastFunc::Next) {
+                if (!RecordNextIter(ins, pNext - 1)) return false;
+            } else {
+                if (!RecordIPairsIter(ins, pNext - 1)) return false;
+            }
             m_bPendingCFunc = true;
             return true;
         }
@@ -871,7 +914,8 @@ bool C_TraceJit::RecordOne(const BcIns_t& ins, const BcIns_t* pNext) {
             const IrRef rCtl = SlotRef(nB + static_cast<std::int32_t>(uA));
             if (rCtl == kIrNone) return false;
             const EIrType eCtl = TypeOf(rCtl);
-            if (eCtl == EIrType::Nil || eCtl == EIrType::Nothing) return false;
+            if (eCtl == EIrType::Nothing) return false;
+            if (eCtl == EIrType::Nil) return true;   // iteration over: fall through
             SetSlot(nB + static_cast<std::int32_t>(uA) - 1, rCtl);
             return true;
         }
@@ -1596,6 +1640,40 @@ bool C_TraceJit::SkipCFuncHeader() {
 // back edge). The iterator is a C function whose whole body is "bump the
 // index, read the array slot, stop on nil" — recorded here as the array access
 // it is, with the bound guard doubling as the loop-exit guard.
+// `for k, v in pairs(t)` — the iterator is the `next` builtin. Recording
+// SIMULATES one step of the same table walk to learn the result types, emits
+// the call through TraceHelpIter (which performs the real step at run time
+// and copies the two results down), and re-reads the result slots with typed
+// in-place loads. A type mismatch at run time — a different key kind, or the
+// iteration ending early — exits to the IterL and the interpreter takes over.
+bool C_TraceJit::RecordNextIter(const BcIns_t& ins, const BcIns_t* pPc) {
+    const std::int32_t nB = m_nBaseOffset;
+    const std::int32_t nA = nB + static_cast<std::int32_t>(ins.A());
+    const IrRef rTab = SlotRef(nA + 2);
+    const IrRef rKey = SlotRef(nA + 3);
+    if (TypeOf(rTab) != EIrType::Tab || rKey == kIrNone) return false;
+    // The interpreter's own copies haven't run yet: the live state and control
+    // are still in the pre-copy slots A-2 / A-1, not A+2 / A+3.
+    const TValue_t tvState = m_pBase[ins.A() - 2];
+    if (!tvState.Is(EValueTag::Table)) return false;
+    auto* pTab = static_cast<C_GcTable*>(tvState.AsGcPointer());
+    const TValue_t tvKey = m_pBase[ins.A() - 1];
+    TValue_t tvOutKey, tvOutVal;
+    const bool bContinues =
+        vm::TableNext(*m_pUniverse, pTab, tvKey, tvOutKey, tvOutVal);
+    const EIrType eKeyType = bContinues ? ObservedType(tvOutKey) : EIrType::Nil;
+    const EIrType eValType = bContinues ? ObservedType(tvOutVal) : EIrType::Nil;
+    if (eKeyType == EIrType::Nothing || eValType == EIrType::Nothing) return false;
+
+    const std::uint32_t uDesc = static_cast<std::uint32_t>(nA);
+    if (EmitSnapped(EIrOp::CallIter, EIrType::Nothing, ConstantInt(uDesc), kIrNone,
+                    pPc) == kIrNone)
+        return false;
+    if (ReloadSlot(nA, eKeyType, pPc) == kIrNone) return false;
+    if (bContinues && ReloadSlot(nA + 1, eValType, pPc) == kIrNone) return false;
+    return m_eState == ETraceState::Recording;
+}
+
 bool C_TraceJit::RecordIPairsIter(const BcIns_t& ins, const BcIns_t* pPc) {
     const std::int32_t nB = m_nBaseOffset;
     const std::int32_t nA = nB + static_cast<std::int32_t>(ins.A());

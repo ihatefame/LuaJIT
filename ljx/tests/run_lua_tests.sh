@@ -55,6 +55,9 @@ check trace_alloc "$(printf '3000\t2\t6000\n1\t4000\t400\n17700\n98775\n1\t500\n
 # protos through one call site, upvalue closures, memoization tables with
 # number keys in the hash part.
 check trace_func "$(printf '1300000\n1000\t1000\n45150\n144000\n336000\n1080\n7713\t4287\n6000\n1000\t3000\ta-b-c')"
+# pairs()/next in traces: hash walks, mixed key and value types, early break,
+# nested iteration, explicit next() calls.
+check trace_pairs "$(printf '125250\t500\n20100\t201000\n0\t42\n100\n12600\n45150\n150\t150')"
 # Differential test: compiled loops must produce byte-identical output to the
 # interpreter. This is the strongest correctness check on the JIT — every
 # script in tests/lua is run both ways and the outputs compared. The poisoned

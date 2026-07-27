@@ -189,6 +189,9 @@ private:
     [[nodiscard]] bool RecordBuiltin(vm::EFastFunc eFfid, const vm::BcIns_t& ins,
                                      const vm::BcIns_t* pPc);
     [[nodiscard]] bool RecordIPairsIter(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
+    [[nodiscard]] bool RecordNextIter(const vm::BcIns_t& ins, const vm::BcIns_t* pPc);
+    [[nodiscard]] IrRef ReloadSlot(std::int32_t nSlot, EIrType eType,
+                                   const vm::BcIns_t* pResumePc);
     [[nodiscard]] bool SkipCFuncHeader();
     [[nodiscard]] bool RecordReturn(const vm::BcIns_t& ins, std::uint32_t uFirst,
                                     std::uint32_t uCount);
@@ -274,5 +277,7 @@ std::uint64_t TraceHelpNewFunc(vm::C_Universe* pUni, vm::TValue_t* pBase,
                                std::uint32_t uDesc, std::uint32_t uTop);
 std::uint64_t TraceHelpCallC(vm::C_Universe* pUni, vm::TValue_t* pBase,
                              std::uint32_t uDesc, std::uint32_t uTop);
+std::uint64_t TraceHelpIter(vm::C_Universe* pUni, vm::TValue_t* pBase,
+                            std::uint32_t uDesc, std::uint32_t uTop);
 
 }  // namespace ljx::jit

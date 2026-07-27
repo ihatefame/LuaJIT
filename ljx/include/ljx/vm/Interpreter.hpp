@@ -213,6 +213,7 @@ public:
     [[nodiscard]] std::uintptr_t ArenaBase() const noexcept { return m_uArenaBase; }
     [[nodiscard]] C_GcTable* Globals() noexcept { return m_pGlobals; }
     [[nodiscard]] C_GcTable* Registry() noexcept { return m_pRegistry; }
+    [[nodiscard]] C_GcTable* TracePins() noexcept { return m_pTracePins; }
     [[nodiscard]] core::C_SegregatedAllocator& Allocator() noexcept { return *m_pAllocator; }
     [[nodiscard]] rt::C_StringInterner& Interner() noexcept { return *m_pInterner; }
     [[nodiscard]] rt::C_MetaResolver& Meta() noexcept { return *m_pMeta; }
@@ -277,6 +278,14 @@ public:
     C_LuaThread* m_pMainThread = nullptr;
     C_GcTable* m_pGlobals = nullptr;
     C_GcTable* m_pRegistry = nullptr;
+    C_GcTable* m_pTracePins = nullptr;   // trace-constant GC anchors (keys)
+    // One-entry `next` position cache: where in pTab's node array uIterKey
+    // was found last. Validated by re-reading the node's key before use, so a
+    // stale entry (resize, free, even address reuse) can never misdirect —
+    // it just misses and falls back to the hash lookup.
+    const C_GcTable* m_pIterHintTab = nullptr;
+    std::uint64_t m_uIterHintKey = 0;
+    std::uint32_t m_uIterHintNode = 0;
     core::C_Prng m_Prng;
     // 8-aligned (MRef target): shared dispatch cell all C closures point at.
     BcIns_t m_insCFuncHeader;

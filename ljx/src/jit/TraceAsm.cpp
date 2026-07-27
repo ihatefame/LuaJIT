@@ -199,6 +199,7 @@ void C_TraceAsm::ComputeInvariance() {
             // keys. The pure leaves (tostring, math.max) lose field hoisting
             // they would not need, which is the safe direction.
             case EIrOp::CallSetNew: case EIrOp::CallSetNewK: case EIrOp::CallC:
+            case EIrOp::CallIter:
                 bResizes = true;
                 [[fallthrough]];
             case EIrOp::CallNewTab: case EIrOp::CallCat: case EIrOp::CallLen:
@@ -243,6 +244,9 @@ void C_TraceAsm::ComputeInvariance() {
                 break;
             case EIrOp::Nop: case EIrOp::SStore: case EIrOp::StoreTV:
             case EIrOp::IncU32: case EIrOp::Loop:
+            // SReload re-reads a slot the preceding helper call just wrote;
+            // its raw slot-index operand would satisfy the default rule.
+            case EIrOp::SReload:
             // End is unconditional control flow, not a guard: hoisting it
             // would leave the trace through snapshot 0 before the body ran.
             case EIrOp::End:
@@ -250,7 +254,7 @@ void C_TraceAsm::ComputeInvariance() {
             // constant operands would otherwise satisfy the default rule.
             case EIrOp::CallNewTab: case EIrOp::CallSetNew: case EIrOp::CallSetNewK:
             case EIrOp::CallCat: case EIrOp::CallLen: case EIrOp::CallNewFunc:
-            case EIrOp::CallC:
+            case EIrOp::CallC: case EIrOp::CallIter:
                 break;
             case EIrOp::LoadU32:
                 bInv = !bResizes && IsStableField(ins.rOp1) && Inv(ins.rOp1);
@@ -311,6 +315,7 @@ void C_TraceAsm::ComputeLiveness() {
         const IrIns_t& ins = m_vIns[uI];
         switch (ins.eOp) {
             case EIrOp::SLoad:
+            case EIrOp::SReload:
                 break;                       // rOp1 is a raw slot index
             case EIrOp::SStore:
                 Use(ins.rOp2, uP);
@@ -613,6 +618,7 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
         case EIrOp::Nop:
             return true;
 
+        case EIrOp::SReload:
         case EIrOp::SLoad: {
             const std::int32_t nDisp = SlotDisp(ins.rOp1);
             if (ins.eType == EIrType::Num) {
@@ -940,6 +946,8 @@ bool C_TraceAsm::EmitOne(std::size_t uIdx) {
             return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpNewFunc), true);
         case EIrOp::CallC:
             return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpCallC), true);
+        case EIrOp::CallIter:
+            return EmitHelperCall(uIdx, reinterpret_cast<const void*>(&TraceHelpIter), false);
 
         case EIrOp::Loop:
             EmitBackEdge();

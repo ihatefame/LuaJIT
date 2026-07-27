@@ -85,6 +85,7 @@ C_Universe* C_Universe::Create(std::size_t uArenaReserveBytes) noexcept {
 
     pUni->m_pGlobals = C_GcTable::New(*pUni, 0, 6);
     pUni->m_pRegistry = C_GcTable::New(*pUni, 0, 2);
+    pUni->m_pTracePins = C_GcTable::New(*pUni, 0, 2);
 
     pUni->m_insCFuncHeader = BcIns_t::MakeAD(EBcOp::FuncC, 0, 0);
     auto* pLoopJit = new (pAlloc->AllocGcObject(sizeof(jit::C_LoopJit)))
